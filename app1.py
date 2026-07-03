@@ -1102,12 +1102,12 @@ def render_threshold_sensitivity_heatmap(df_sens):
         span = float(row.max() - row.min())
         heat_norm.loc[idx] = 0.5 if span <= 1e-12 else (row - row.min()) / span
 
-    text_values = heat_display.copy()
+    text_values = heat_display.astype(object)
     for idx in text_values.index:
         if idx in {"Edge", "Jumlah Klaster", "Komponen Raw"}:
-            text_values.loc[idx] = text_values.loc[idx].map(lambda x: f"{float(x):.0f}")
+            text_values.loc[idx] = heat_display.loc[idx].map(lambda x: f"{float(x):.0f}")
         else:
-            text_values.loc[idx] = text_values.loc[idx].map(lambda x: f"{float(x):.4f}")
+            text_values.loc[idx] = heat_display.loc[idx].map(lambda x: f"{float(x):.4f}")
 
     fig_heat = go.Figure(
         data=go.Heatmap(

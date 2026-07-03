@@ -6664,6 +6664,48 @@ def render_journal_q1_page(
     k6.metric("Aktor Strategis", strategic_txt, help="Node dengan peran strategis dari empat metrik centrality (ambang kuartil Q75).")
 
     # ============================================================
+    # 2b. PETA JALAN TESIS — JAWABAN ATAS RUMUSAN MASALAH
+    # ============================================================
+    intra_dusun_txt = (
+        f"{intra_dusun_share:.0%}" if np.isfinite(_safe_float_metric(intra_dusun_share, default=np.nan)) else "n/a"
+    )
+    with subbab_dropdown("0. Peta Jalan Tesis — Jawaban atas Rumusan Masalah", expanded=True):
+        st.markdown(
+            "Tabel ini memetakan setiap <b>rumusan masalah</b> tesis ke metode, bukti terhitung dari data, dan "
+            "subbab tempat temuannya dielaborasi — sebagai pemeriksaan bahwa seluruh pertanyaan penelitian terjawab.",
+            unsafe_allow_html=True,
+        )
+        roadmap_rows = [
+            {
+                "Rumusan Masalah": "RM1 — Memodelkan data mikro DDP ke SNA berbasis dimensi IKD",
+                "Metode": f"Graf kemiripan lima dimensi IKD (basis {basis_col}, {method_label}); "
+                f"ambang otomatis {threshold_used:.2f} (strong-ties ~ rata-rata distribusi, Cheng et al., 2024)",
+                "Bukti Terhitung": f"{n_nodes} node, {n_edges} edge, densitas {density:.3f}, derajat rata-rata {avg_degree:.2f}",
+                "Subbab": "2 (Metodologi), 3 (Struktur), 10 (Robustness)",
+            },
+            {
+                "Rumusan Masalah": "RM2 — Louvain (klaster kerentanan), assortativity (segregasi), centrality (aktor kunci)",
+                "Metode": "Louvain (modularitas); numeric & attribute assortativity (Newman 2002/2003) + Montes; "
+                "empat centrality (Freeman; Majeed & Rauf)",
+                "Bukti Terhitung": f"{n_clusters} komunitas (Q={modularity_q:.3f}); homofili agregat r={r_overall:.3f}; "
+                f"Montes Qw*={q_w_star:.3f}/Qb*={q_b_star:.3f}; {strategic_txt} aktor strategis",
+                "Subbab": "3-5 (Struktur, Homofili, Montes), 8 (Aktor), 10 (Klaster Kerentanan)",
+            },
+            {
+                "Rumusan Masalah": "RM3 — Mendukung intervensi kebijakan & evaluasi ketepatan sasaran bansos",
+                "Metode": "Audit exclusion/inclusion error berbasis komunitas; segregasi spasial per dusun (Duncan D); "
+                "prioritas klaster kerentanan",
+                "Bukti Terhitung": f"exclusion {excl_txt}, inclusion {incl_txt}; {intra_dusun_txt} edge intra-dusun",
+                "Subbab": "6 (Bansos), 7 (Digital), 9 (Spasial), 10 (Klaster Kerentanan), 11 (Implikasi)",
+            },
+        ]
+        st.dataframe(pd.DataFrame(roadmap_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "Ketiga rumusan masalah terjawab oleh pipeline yang sama dan reprodusibel: pemodelan (RM1), "
+            "analitik jaringan (RM2), dan translasi kebijakan (RM3). Angka mengikuti konfigurasi run aktif."
+        )
+
+    # ============================================================
     # 3. NOVELTY & GAP
     # ============================================================
     with subbab_dropdown("1. Kebaruan (Novelty) dan Celah Penelitian", expanded=True):
@@ -6683,6 +6725,26 @@ def render_journal_q1_page(
             "berbasis komunitas jaringan, bukan sekadar agregat administratif.</li>"
             "<li><b>Inklusi digital:</b> pengukuran homofili akses internet/ponsel sebagai indikator "
             "<i>kesenjangan digital</i> yang terstruktur secara relasional.</li>"
+            "</ul>"
+            "<b>Landasan konseptual (selaras kerangka teori tesis).</b>"
+            "<ul>"
+            "<li><b>Data Desa Presisi (DDP)</b> menghasilkan data mikro <i>by name, by address, by coordinate</i> "
+            "secara <i>bottom-up</i> (Sjaf et al., 2022), namun keluarannya masih tabular/spasial dan <i>belum "
+            "menangkap dimensi relasional</i> antar-rumah tangga — celah yang diisi studi ini.</li>"
+            "<li><b>Homofili</b> (McPherson et al., 2001; Montes et al., 2018): rumah tangga cenderung terhubung "
+            "dengan yang berkemiripan atribut. Mengabaikannya berisiko <i>overestimation</i> efektivitas kebijakan "
+            "(Aral et al., 2013) — karena itu homofili diukur eksplisit, bukan diasumsikan nol.</li>"
+            "<li><b>Skor IKD</b> dihitung dengan <i>rata-rata geometrik</i> untuk meredam distorsi nilai ekstrem "
+            "(Olivier et al., 2008), dengan strata BPS (2014): Rendah &lt;60, Sedang 60&ndash;70, Tinggi 70&ndash;80, "
+            "Sangat Tinggi &gt;80.</li>"
+            "<li><b>Ambang jaringan</b> tidak dipilih acak: nilai dipilih agar jumlah <i>ikatan kuat</i> (strong ties) "
+            "paling mendekati rata-rata distribusi jaringan (Cheng et al., 2024), lalu diuji sensitivitasnya "
+            "(subbab Robustness) untuk resiliensi struktural.</li>"
+            "<li><b>Deteksi komunitas Louvain</b> dipilih karena efisiensi komputasi dan optimalisasi modularitas "
+            "iteratif pada jaringan besar (Blondel et al., 2008; Lee et al., 2020), menghasilkan partisi yang "
+            "mencerminkan stratifikasi kesejahteraan nyata.</li>"
+            "<li><b>Empat pilar centrality</b> (Freeman, 1979; kerangka Majeed &amp; Rauf, 2020) memetakan aktor "
+            "strategis sebagai jembatan informasi dan motor difusi bantuan di tingkat mikro.</li>"
             "</ul>",
             unsafe_allow_html=True,
         )
@@ -7171,9 +7233,131 @@ def render_journal_q1_page(
             )
 
     # ============================================================
+    # 11b. TEMUAN 8 — KLASTER KERENTANAN (SINTESIS RM2 + RM3)
+    # ============================================================
+    with subbab_dropdown("10. Temuan Kunci 8 — Deteksi dan Prioritas Klaster Kerentanan", expanded=False):
+        if df_role_journal.empty or "Klaster Louvain" not in df_role_journal.columns:
+            st.info(
+                "Klaster kerentanan belum dapat disusun — data klaster/kesejahteraan belum lengkap pada jaringan aktif."
+            )
+        else:
+            work_vuln = df_role_journal.copy()
+            work_vuln["_ikd"] = pd.to_numeric(work_vuln["IKD Agregat"], errors="coerce")
+            work_vuln["_rentan"] = (
+                work_vuln["Status BPS"].astype(str).str.strip().str.lower().isin(["rendah", "sedang"])
+            )
+            work_vuln["_penerima"] = work_vuln["Status Bansos"].eq("Penerima")
+            vuln_rows = []
+            for cluster_id, sub_cl in work_vuln.groupby("Klaster Louvain"):
+                n_cl = int(len(sub_cl))
+                n_rentan = int(sub_cl["_rentan"].sum())
+                excl_cl = (
+                    float((~sub_cl.loc[sub_cl["_rentan"], "_penerima"]).mean()) if n_rentan > 0 else np.nan
+                )
+                rerata_ikd_cl = float(sub_cl["_ikd"].mean()) if sub_cl["_ikd"].notna().any() else np.nan
+                vuln_rows.append(
+                    {
+                        "Klaster": f"Klaster {int(cluster_id)}",
+                        "Jumlah KK": n_cl,
+                        "Rerata IKD Agregat": rerata_ikd_cl,
+                        "Kategori Rendah/Sedang (%)": 100.0 * float(sub_cl["_rentan"].mean()),
+                        "Penerima Bansos (%)": 100.0 * float(sub_cl["_penerima"].mean()),
+                        "Exclusion Error Klaster (%)": 100.0 * excl_cl if np.isfinite(_safe_float_metric(excl_cl, default=np.nan)) else np.nan,
+                        "Aktor Strategis": int(sub_cl["Peran Struktural"].ne("Node umum").sum()),
+                    }
+                )
+            df_vuln = pd.DataFrame(vuln_rows)
+
+            # Skor kerentanan komposit (0-100): rata-rata tiga komponen ternormalisasi
+            #  (a) proporsi KK rentan; (b) exclusion error klaster; (c) IKD rendah (inversi terhadap strata BPS <60..>80)
+            share_rentan = (df_vuln["Kategori Rendah/Sedang (%)"] / 100.0).clip(0, 1)
+            excl_comp = (df_vuln["Exclusion Error Klaster (%)"].fillna(0.0) / 100.0).clip(0, 1)
+            ikd_inv = ((80.0 - df_vuln["Rerata IKD Agregat"]) / (80.0 - 60.0)).clip(0, 1)
+            ikd_inv = ikd_inv.fillna(0.5)
+            df_vuln["Skor Kerentanan"] = 100.0 * (0.4 * share_rentan + 0.3 * excl_comp + 0.3 * ikd_inv)
+            df_vuln = df_vuln.sort_values("Skor Kerentanan", ascending=False).reset_index(drop=True)
+            df_vuln.insert(0, "Peringkat", range(1, len(df_vuln) + 1))
+
+            n_vuln_priority = int((df_vuln["Skor Kerentanan"] >= 50.0).sum())
+            top_vuln = df_vuln.iloc[0]
+            st.markdown(
+                "Menjawab RM2 (<i>deteksi klaster kerentanan</i>), komunitas Louvain diberi <b>skor kerentanan</b> "
+                "komposit dari tiga komponen ternormalisasi: proporsi KK kategori Rendah/Sedang (bobot 0,4), "
+                "<i>exclusion error</i> internal klaster (0,3), dan tingkat IKD rendah relatif strata BPS (0,3). "
+                "Klaster berskor tinggi adalah <b>prioritas intervensi</b>.",
+                unsafe_allow_html=True,
+            )
+            vk1, vk2, vk3 = st.columns(3)
+            vk1.metric("Klaster Prioritas (skor ≥ 50)", f"{n_vuln_priority}")
+            vk2.metric("Klaster Paling Rentan", top_vuln["Klaster"], help=f"Skor kerentanan {top_vuln['Skor Kerentanan']:.1f}.")
+            vk3.metric(
+                "Exclusion Error Klaster Teratas",
+                f"{top_vuln['Exclusion Error Klaster (%)']:.0f}%" if np.isfinite(_safe_float_metric(top_vuln["Exclusion Error Klaster (%)"], default=np.nan)) else "n/a",
+            )
+
+            fig_vuln = px.bar(
+                df_vuln.sort_values("Skor Kerentanan"),
+                x="Skor Kerentanan",
+                y="Klaster",
+                orientation="h",
+                color="Skor Kerentanan",
+                color_continuous_scale="OrRd",
+                range_color=[0, 100],
+                text=df_vuln.sort_values("Skor Kerentanan")["Skor Kerentanan"].map(lambda v: f"{v:.0f}"),
+                custom_data=["Rerata IKD Agregat", "Kategori Rendah/Sedang (%)", "Exclusion Error Klaster (%)"],
+            )
+            fig_vuln.update_traces(
+                textposition="outside",
+                cliponaxis=False,
+                hovertemplate="%{y}<br>Skor kerentanan: %{x:.1f}<br>Rerata IKD: %{customdata[0]:.1f}<br>"
+                "% Rendah/Sedang: %{customdata[1]:.1f}%<br>Exclusion error: %{customdata[2]:.1f}%<extra></extra>",
+            )
+            style_publication_figure(
+                fig_vuln,
+                title="Peringkat Klaster Kerentanan (Prioritas Intervensi)",
+                height=max(380, 120 + 42 * len(df_vuln)),
+                xaxis_title="Skor kerentanan (0-100)",
+                yaxis_title="",
+                showlegend=False,
+            )
+            fig_vuln.update_xaxes(range=[0, 100])
+            st.plotly_chart(fig_vuln, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+
+            st.dataframe(
+                df_vuln.style.format(
+                    {
+                        "Rerata IKD Agregat": "{:.2f}",
+                        "Kategori Rendah/Sedang (%)": "{:.1f}",
+                        "Penerima Bansos (%)": "{:.1f}",
+                        "Exclusion Error Klaster (%)": "{:.1f}",
+                        "Skor Kerentanan": "{:.1f}",
+                    }
+                ).background_gradient(cmap="OrRd", subset=["Skor Kerentanan"]),
+                use_container_width=True,
+            )
+            st.download_button(
+                "Unduh Peringkat Klaster Kerentanan (Anonim)",
+                data=df_vuln.to_csv(index=False).encode("utf-8"),
+                file_name="peringkat_klaster_kerentanan_jurnal.csv",
+                mime="text/csv",
+                key="journal_vuln_cluster_download",
+            )
+            st.info(
+                f"{top_vuln['Klaster']} adalah komunitas paling rentan (skor {top_vuln['Skor Kerentanan']:.1f}): "
+                f"rerata IKD {top_vuln['Rerata IKD Agregat']:.1f}, {top_vuln['Kategori Rendah/Sedang (%)']:.0f}% KK "
+                f"berkategori Rendah/Sedang, dengan {int(top_vuln['Aktor Strategis'])} aktor strategis yang dapat "
+                "menjadi titik masuk difusi program di dalamnya."
+            )
+            st.caption(
+                "Skor kerentanan bersifat komposit dan transparan (bobot 0,4/0,3/0,3) sehingga dapat direplikasi dan "
+                "disesuaikan. Hasil adalah indikasi awal prioritas berbasis data sekunder — bukan penetapan sasaran "
+                "final, dan wajib diverifikasi lapangan."
+            )
+
+    # ============================================================
     # 12. ROBUSTNESS / SENSITIVITY (RIGOR METODOLOGIS)
     # ============================================================
-    with subbab_dropdown("10. Robustness — Sensitivitas Threshold (untuk menjawab reviewer)", expanded=False):
+    with subbab_dropdown("11. Robustness — Sensitivitas Threshold (untuk menjawab reviewer)", expanded=False):
         sens = meta.get("threshold_sensitivity") or meta.get("threshold_distribution") or []
         df_sens = pd.DataFrame(sens)
         if not df_sens.empty and "threshold" in df_sens.columns:
@@ -7204,7 +7388,7 @@ def render_journal_q1_page(
     # ============================================================
     # 13. IMPLIKASI KEBIJAKAN & POSITIONING JURNAL
     # ============================================================
-    with subbab_dropdown("11. Implikasi Kebijakan dan Positioning Jurnal Q1", expanded=False):
+    with subbab_dropdown("12. Implikasi Kebijakan dan Positioning Jurnal Q1", expanded=False):
         st.markdown(
             "<b>Implikasi kebijakan.</b>"
             "<ul>"
@@ -7277,10 +7461,18 @@ def render_journal_q1_page(
 
         st.markdown(
             "<b>Referensi metodologis kunci.</b><br>"
+            "Sjaf, S., dkk. (2022). Data Desa Presisi: pendekatan <i>bottom-up</i> pemotretan kondisi riil desa.<br>"
+            "McPherson, M., Smith-Lovin, L., &amp; Cook, J.M. (2001). Birds of a feather: Homophily in social networks. <i>Annu. Rev. Sociol.</i><br>"
+            "Aral, S., Muchnik, L., &amp; Sundararajan, A. (2013). Engineering social contagions... (risiko overestimation bila homofili diabaikan).<br>"
+            "Olivier, J., dkk. (2008). Rasional rata-rata geometrik untuk indeks komposit (meredam distorsi nilai ekstrem).<br>"
+            "Cheng, dkk. (2024). Penentuan ambang jaringan berbasis strong-ties mendekati rata-rata distribusi.<br>"
             "Blondel, V.D., dkk. (2008). Fast unfolding of communities in large networks. <i>J. Stat. Mech.</i> — deteksi komunitas Louvain.<br>"
-            "Newman, M.E.J. (2003). Mixing patterns in networks. <i>Physical Review E</i> — assortativity.<br>"
-            "Montes, F., dkk. (2018). Benchmarking seeding strategies... (dekomposisi within-between assortativity).<br>"
+            "Lee, dkk. (2020). Efisiensi Louvain pada jaringan berskala besar.<br>"
+            "Newman, M.E.J. (2002). Assortative mixing in networks. <i>Phys. Rev. Lett.</i> — assortativity numerik.<br>"
+            "Newman, M.E.J. (2003). Mixing patterns in networks. <i>Physical Review E</i> — attribute assortativity.<br>"
+            "Montes, F., dkk. (2018). Dekomposisi within-between assortativity.<br>"
             "Freeman, L.C. (1979). Centrality in social networks: Conceptual clarification. <i>Social Networks</i>.<br>"
+            "Majeed, A. &amp; Rauf, I. (2020). Kerangka empat pilar centrality untuk analisis jaringan.<br>"
             "Borgatti, S.P. (2006). Identifying sets of key players in a social network. <i>Comput. Math. Organ. Theory</i>.<br>"
             "Valente, T.W. &amp; Pumpuang, P. (2007). Identifying opinion leaders to promote behavior change. <i>Health Educ. Behav.</i><br>"
             "Valente, T.W. (2012). Network interventions. <i>Science</i>, 337(6090).<br>"

@@ -6608,6 +6608,206 @@ def render_journal_network_figure(graph_obj, partition, df_role_journal, layout_
     return fig
 
 
+def _partition_nmi(part_a, part_b, nodes):
+    """Normalized Mutual Information antara dua partisi komunitas (normalisasi rata-rata aritmetika)."""
+    from collections import Counter
+
+    n = len(nodes)
+    if n == 0:
+        return np.nan
+    count_a = Counter(part_a.get(x, -1) for x in nodes)
+    count_b = Counter(part_b.get(x, -1) for x in nodes)
+    joint = Counter((part_a.get(x, -1), part_b.get(x, -1)) for x in nodes)
+    mi = 0.0
+    for (a, b), c in joint.items():
+        p_ab = c / n
+        p_a = count_a[a] / n
+        p_b = count_b[b] / n
+        mi += p_ab * np.log(p_ab / (p_a * p_b))
+    h_a = -sum((c / n) * np.log(c / n) for c in count_a.values())
+    h_b = -sum((c / n) * np.log(c / n) for c in count_b.values())
+    denom = (h_a + h_b) / 2.0
+    return float(mi / denom) if denom > 1e-12 else 1.0
+
+
+def compute_journal_graph_diagnostics(graph_obj, partition, dusun_attr=None, n_perm=120, n_rewire=30, n_seeds=12, seed=42):
+    """Diagnostik topologi + uji signifikansi null model yang lazim diminta reviewer internasional.
+
+    - Topologi global: komponen, LCC, transitivity, clustering, path length, diameter,
+      degree assortativity, small-world sigma (Watts & Strogatz 1998; Humphries & Gurney 2008).
+    - Signifikansi: permutasi atribut node (homofili) dan rewiring degree-preserving
+      (Maslov & Sneppen 2002) untuk modularitas struktur.
+    - Stabilitas Louvain lintas seed (Q, jumlah klaster, NMI antar-partisi).
+    """
+    G0 = graph_obj
+    if G0 is None or G0.number_of_nodes() < 5 or G0.number_of_edges() < 5:
+        return {}
+    n = G0.number_of_nodes()
+    m = G0.number_of_edges()
+    heavy = n > 700
+    if heavy:
+        n_perm, n_rewire, n_seeds = 60, 12, 8
+    rng = np.random.default_rng(seed)
+    diag = {"n_nodes": n, "n_edges": m}
+
+    # ---------- Topologi global ----------
+    comps = list(nx.connected_components(G0))
+    lcc_nodes = max(comps, key=len)
+    G_lcc = G0.subgraph(lcc_nodes)
+    diag["n_components"] = len(comps)
+    diag["lcc_share"] = 100.0 * len(lcc_nodes) / n
+    diag["transitivity"] = float(nx.transitivity(G0))
+    diag["avg_clustering"] = float(nx.average_clustering(G0))
+    try:
+        diag["degree_assortativity"] = float(nx.degree_assortativity_coefficient(G0))
+    except Exception:
+        diag["degree_assortativity"] = np.nan
+    diag["avg_path_length"] = np.nan
+    diag["diameter"] = np.nan
+    if not heavy and G_lcc.number_of_nodes() > 2:
+        try:
+            diag["avg_path_length"] = float(nx.average_shortest_path_length(G_lcc))
+            diag["diameter"] = float(nx.diameter(G_lcc))
+        except Exception:
+            pass
+
+    # ---------- Null model struktur: rewiring degree-preserving ----------
+    H_base = nx.Graph()
+    H_base.add_nodes_from(G0.nodes())
+    H_base.add_edges_from(G0.edges())
+    try:
+        part_obs_struct = community_louvain.best_partition(H_base, random_state=42)
+        q_obs_struct = float(community_louvain.modularity(part_obs_struct, H_base))
+    except Exception:
+        q_obs_struct = np.nan
+    q_null, c_null, l_null = [], [], []
+    for i in range(n_rewire):
+        H = H_base.copy()
+        try:
+            nx.double_edge_swap(H, nswap=4 * m, max_tries=100 * m, seed=int(rng.integers(0, 2**31 - 1)))
+        except Exception:
+            pass
+        try:
+            part_h = community_louvain.best_partition(H, random_state=i)
+            q_null.append(float(community_louvain.modularity(part_h, H)))
+        except Exception:
+            pass
+        c_null.append(float(nx.average_clustering(H)))
+        if not heavy:
+            try:
+                lcc_h = max(nx.connected_components(H), key=len)
+                sub_h = H.subgraph(lcc_h)
+                if sub_h.number_of_nodes() > 2:
+                    l_null.append(float(nx.average_shortest_path_length(sub_h)))
+            except Exception:
+                pass
+    diag["q_obs_struct"] = q_obs_struct
+    diag["q_null_mean"] = float(np.mean(q_null)) if q_null else np.nan
+    diag["q_null_std"] = float(np.std(q_null)) if q_null else np.nan
+    diag["n_rewire_efektif"] = len(q_null)
+
+    # Small-world sigma = (C/C_rand) / (L/L_rand)
+    c_rand = float(np.mean(c_null)) if c_null else np.nan
+    l_rand = float(np.mean(l_null)) if l_null else np.nan
+    diag["c_rand"] = c_rand
+    diag["l_rand"] = l_rand
+    sigma = np.nan
+    if (
+        np.isfinite(diag["avg_clustering"]) and np.isfinite(c_rand) and c_rand > 1e-9
+        and np.isfinite(diag["avg_path_length"]) and np.isfinite(l_rand) and l_rand > 1e-9
+    ):
+        ratio_l = diag["avg_path_length"] / l_rand
+        if ratio_l > 1e-9:
+            sigma = (diag["avg_clustering"] / c_rand) / ratio_l
+    diag["small_world_sigma"] = float(sigma) if np.isfinite(_safe_float_metric(sigma, default=np.nan)) else np.nan
+
+    # ---------- Uji permutasi homofili (dua sisi) ----------
+    def _empirical_p_two_sided(obs, null_vals):
+        arr = np.asarray([v for v in null_vals if np.isfinite(v)], dtype=float)
+        if arr.size < 10 or not np.isfinite(obs):
+            return np.nan, np.nan
+        mu = float(arr.mean())
+        sd = float(arr.std())
+        z = (obs - mu) / sd if sd > 1e-12 else np.nan
+        extreme = int(np.sum(np.abs(arr - mu) >= abs(obs - mu)))
+        p = (1.0 + extreme) / (arr.size + 1.0)
+        return z, p
+
+    attr_specs = [
+        ("Homofili IKD Agregat (r)", "f_ikr_dari_rekap_kk", "numeric"),
+        ("Homofili Status Bansos (r)", "bansos_num", "attribute"),
+        ("Homofili Akses Internet (r)", "internet_num", "attribute"),
+        ("Homofili Kepemilikan Ponsel (r)", "ponsel_num", "attribute"),
+    ]
+    if dusun_attr:
+        attr_specs.append(("Assortativity Spasial Dusun (r)", dusun_attr, "attribute"))
+    sig_rows = []
+    H_attr = G0.copy()
+    node_list = list(G0.nodes())
+    for label, attr, kind in attr_specs:
+        values = [G0.nodes[nd].get(attr) for nd in node_list]
+        if all(pd.isnull(v) for v in values):
+            continue
+        fn = safe_numeric_assortativity if kind == "numeric" else safe_attribute_assortativity
+        r_obs = float(fn(G0, attr, default=np.nan))
+        if not np.isfinite(r_obs):
+            continue
+        null_vals = []
+        vals_work = list(values)
+        for _ in range(n_perm):
+            rng.shuffle(vals_work)
+            nx.set_node_attributes(H_attr, {nd: vals_work[i] for i, nd in enumerate(node_list)}, attr)
+            null_vals.append(float(fn(H_attr, attr, default=np.nan)))
+        z, p = _empirical_p_two_sided(r_obs, null_vals)
+        arr_ok = [v for v in null_vals if np.isfinite(v)]
+        sig_rows.append(
+            {
+                "Metrik": label,
+                "Observasi": r_obs,
+                "Null Mean": float(np.mean(arr_ok)) if arr_ok else np.nan,
+                "Null SD": float(np.std(arr_ok)) if arr_ok else np.nan,
+                "z-score": z,
+                "p (empiris)": p,
+                "Null Model": f"Permutasi atribut ({len(arr_ok)}x)",
+            }
+        )
+    # Baris modularitas struktur (rewiring)
+    if np.isfinite(_safe_float_metric(q_obs_struct, default=np.nan)) and len(q_null) >= 10:
+        z_q, p_q = _empirical_p_two_sided(q_obs_struct, q_null)
+        sig_rows.insert(
+            0,
+            {
+                "Metrik": "Modularitas Q (struktur, tanpa bobot)",
+                "Observasi": q_obs_struct,
+                "Null Mean": diag["q_null_mean"],
+                "Null SD": diag["q_null_std"],
+                "z-score": z_q,
+                "p (empiris)": p_q,
+                "Null Model": f"Rewiring degree-preserving ({len(q_null)}x)",
+            },
+        )
+    diag["sig_rows"] = sig_rows
+
+    # ---------- Stabilitas Louvain lintas seed ----------
+    q_seeds, k_seeds, nmi_seeds = [], [], []
+    for s in range(n_seeds):
+        try:
+            part_s = community_louvain.best_partition(G0, weight="weight", random_state=s)
+            q_seeds.append(float(community_louvain.modularity(part_s, G0, weight="weight")))
+            k_seeds.append(int(len(set(part_s.values()))))
+            if partition:
+                nmi_seeds.append(_partition_nmi(part_s, partition, node_list))
+        except Exception:
+            continue
+    diag["q_seed_mean"] = float(np.mean(q_seeds)) if q_seeds else np.nan
+    diag["q_seed_std"] = float(np.std(q_seeds)) if q_seeds else np.nan
+    diag["k_seed_min"] = int(min(k_seeds)) if k_seeds else 0
+    diag["k_seed_max"] = int(max(k_seeds)) if k_seeds else 0
+    diag["nmi_mean"] = float(np.mean(nmi_seeds)) if nmi_seeds else np.nan
+    diag["n_seeds_efektif"] = len(q_seeds)
+    return diag
+
+
 def render_journal_q1_page(
     graph_obj,
     partition,
@@ -6841,6 +7041,28 @@ def render_journal_q1_page(
             )
         cov_df = pd.DataFrame(rows_cov)
 
+    # Diagnostik topologi + uji signifikansi null model (dimemo per konfigurasi agar
+    # tidak dihitung ulang pada setiap interaksi widget di halaman ini)
+    diag_key = f"journal_diag::{selected_desa}::{basis_col}::{method_label}::{n_nodes}::{n_edges}::{threshold_used:.4f}"
+    if diag_key not in st.session_state:
+        try:
+            st.session_state[diag_key] = compute_journal_graph_diagnostics(
+                G, partition, dusun_attr=dusun_attr_journal
+            )
+        except Exception:
+            st.session_state[diag_key] = {}
+    diag_journal = st.session_state.get(diag_key) or {}
+    sig_rows_journal = diag_journal.get("sig_rows", [])
+    sig_abstract_txt = ""
+    if sig_rows_journal:
+        sig_ok = [row for row in sig_rows_journal if np.isfinite(_safe_float_metric(row.get("p (empiris)"), default=np.nan))]
+        n_signif = sum(1 for row in sig_ok if row["p (empiris)"] < 0.05)
+        if sig_ok:
+            sig_abstract_txt = (
+                f"Uji null model (permutasi atribut dan rewiring degree-preserving) menunjukkan "
+                f"<b>{n_signif}/{len(sig_ok)}</b> metrik struktur/homofili signifikan pada p&lt;0,05. "
+            )
+
     # ============================================================
     # 2. ABSTRAK TERSTRUKTUR (OTOMATIS)
     # ============================================================
@@ -6865,6 +7087,7 @@ def render_journal_q1_page(
         f"<b>{n_role_multi}</b> aktor multiperan, <b>{n_role_core}</b> aktor sentral berpengaruh, dan "
         f"<b>{n_role_broker}</b> broker antar-kelompok. "
         f"{spatial_abstract_txt}"
+        f"{sig_abstract_txt}"
         f"<b>Implikasi.</b> Struktur relasional desa memberi lapisan bukti baru untuk memperbaiki "
         f"akurasi penargetan bantuan sosial, pemerataan inklusi digital, serta pemilihan aktor strategis "
         f"sebagai agen difusi program."
@@ -6899,7 +7122,7 @@ def render_journal_q1_page(
                 "Metode": f"Graf kemiripan lima dimensi IKD (basis {basis_col}, {method_label}); "
                 f"ambang otomatis {threshold_used:.2f} (strong-ties ~ rata-rata distribusi, Cheng et al., 2024)",
                 "Bukti Terhitung": f"{n_nodes} node, {n_edges} edge, densitas {density:.3f}, derajat rata-rata {avg_degree:.2f}",
-                "Subbab": "2 (Metodologi), 3 (Struktur), 10 (Robustness)",
+                "Subbab": "2 (Metodologi), 3 (Struktur), 11 (Diagnostik & Signifikansi), 12 (Robustness)",
             },
             {
                 "Rumusan Masalah": "RM2 — Louvain (klaster kerentanan), assortativity (segregasi), centrality (aktor kunci)",
@@ -6907,14 +7130,14 @@ def render_journal_q1_page(
                 "empat centrality (Freeman; Majeed & Rauf)",
                 "Bukti Terhitung": f"{n_clusters} komunitas (Q={modularity_q:.3f}); homofili agregat r={r_overall:.3f}; "
                 f"Montes Qw*={q_w_star:.3f}/Qb*={q_b_star:.3f}; {strategic_txt} aktor strategis",
-                "Subbab": "3-5 (Struktur, Homofili, Montes), 8 (Aktor), 10 (Klaster Kerentanan)",
+                "Subbab": "3-5 (Struktur, Homofili, Montes), 8 (Aktor), 10 (Klaster Kerentanan), 11 (Signifikansi)",
             },
             {
                 "Rumusan Masalah": "RM3 — Mendukung intervensi kebijakan & evaluasi ketepatan sasaran bansos",
                 "Metode": "Audit exclusion/inclusion error berbasis komunitas; segregasi spasial per dusun (Duncan D); "
                 "prioritas klaster kerentanan",
                 "Bukti Terhitung": f"exclusion {excl_txt}, inclusion {incl_txt}; {intra_dusun_txt} edge intra-dusun",
-                "Subbab": "6 (Bansos), 7 (Digital), 9 (Spasial), 10 (Klaster Kerentanan), 11 (Implikasi)",
+                "Subbab": "6 (Bansos), 7 (Digital), 9 (Spasial), 10 (Klaster Kerentanan), 13 (Implikasi)",
             },
         ]
         st.dataframe(pd.DataFrame(roadmap_rows), use_container_width=True, hide_index=True)
@@ -7673,9 +7896,173 @@ def render_journal_q1_page(
             )
 
     # ============================================================
-    # 12. ROBUSTNESS / SENSITIVITY (RIGOR METODOLOGIS)
+    # 12. DIAGNOSTIK TOPOLOGI & UJI SIGNIFIKANSI (STANDAR REVIEWER)
     # ============================================================
-    with subbab_dropdown("11. Robustness — Sensitivitas Threshold (untuk menjawab reviewer)", expanded=False):
+    with subbab_dropdown("11. Diagnostik Topologi dan Uji Signifikansi Null Model (Standar Reviewer)", expanded=False):
+        if not diag_journal:
+            st.info("Diagnostik topologi belum dapat dihitung — graf terlalu kecil untuk pengujian null model.")
+        else:
+            st.markdown(
+                "Reviewer internasional untuk studi berbasis graf lazim meminta tiga hal yang dijawab subbab ini: "
+                "(1) <b>karakterisasi topologi global</b> di luar densitas (clustering, path length, komponen, "
+                "small-world); (2) <b>uji signifikansi terhadap null model</b> — apakah modularitas dan homofili "
+                "yang diamati benar-benar melebihi ekspektasi acak (permutasi atribut; rewiring degree-preserving, "
+                "Maslov &amp; Sneppen 2002); dan (3) <b>stabilitas algoritmik</b> — karena Louvain stokastik, hasil "
+                "harus konsisten lintas seed.",
+                unsafe_allow_html=True,
+            )
+
+            # --- (1) Topologi global ---
+            st.markdown("<b>Karakterisasi Topologi Global</b>", unsafe_allow_html=True)
+            def _fmt_diag(value, digits=3, suffix=""):
+                val = _safe_float_metric(value, default=np.nan)
+                return f"{val:.{digits}f}{suffix}" if np.isfinite(val) else "n/a"
+
+            sigma_val = _safe_float_metric(diag_journal.get("small_world_sigma"), default=np.nan)
+            topo_rows = [
+                {"Metrik": "Jumlah komponen terhubung", "Nilai": f"{int(diag_journal.get('n_components', 0))}",
+                 "Interpretasi": "Berapa banyak subjaringan terpisah; komponen tunggal berarti seluruh KK saling terjangkau."},
+                {"Metrik": "Proporsi node pada komponen terbesar (LCC)", "Nilai": _fmt_diag(diag_journal.get("lcc_share"), 1, "%"),
+                 "Interpretasi": "Cakupan analisis jalur/jarak; LCC besar menandakan jaringan utuh."},
+                {"Metrik": "Transitivity (global clustering)", "Nilai": _fmt_diag(diag_journal.get("transitivity")),
+                 "Interpretasi": "Kecenderungan segitiga relasi — khas jaringan sosial bila jauh di atas graf acak."},
+                {"Metrik": "Rata-rata clustering coefficient", "Nilai": _fmt_diag(diag_journal.get("avg_clustering")),
+                 "Interpretasi": f"Dibandingkan graf acak degree-preserving: {_fmt_diag(diag_journal.get('c_rand'))}."},
+                {"Metrik": "Rata-rata panjang jalur (LCC)", "Nilai": _fmt_diag(diag_journal.get("avg_path_length"), 2),
+                 "Interpretasi": f"Ekspektasi acak: {_fmt_diag(diag_journal.get('l_rand'), 2)}; jalur pendek = difusi cepat."},
+                {"Metrik": "Diameter (LCC)", "Nilai": _fmt_diag(diag_journal.get("diameter"), 0),
+                 "Interpretasi": "Jarak terpanjang antar pasangan node — batas atas rantai penyebaran informasi."},
+                {"Metrik": "Degree assortativity", "Nilai": _fmt_diag(diag_journal.get("degree_assortativity")),
+                 "Interpretasi": "Positif: node ramai terhubung ke node ramai (khas jaringan sosial; Newman 2002)."},
+                {"Metrik": "Small-world sigma (Humphries & Gurney 2008)", "Nilai": _fmt_diag(sigma_val, 2),
+                 "Interpretasi": "sigma > 1 mengindikasikan small-world: clustering tinggi dengan jalur tetap pendek."},
+            ]
+            st.dataframe(pd.DataFrame(topo_rows), use_container_width=True, hide_index=True)
+
+            # --- (2) Uji signifikansi null model ---
+            st.markdown("<b>Uji Signifikansi terhadap Null Model</b>", unsafe_allow_html=True)
+            if sig_rows_journal:
+                df_sig = pd.DataFrame(sig_rows_journal)
+                df_sig["Signifikan (α=0,05)"] = df_sig["p (empiris)"].map(
+                    lambda p: "Ya" if np.isfinite(_safe_float_metric(p, default=np.nan)) and p < 0.05 else "Tidak"
+                )
+                st.dataframe(
+                    df_sig.style.format(
+                        {
+                            "Observasi": "{:.3f}",
+                            "Null Mean": "{:.3f}",
+                            "Null SD": "{:.3f}",
+                            "z-score": "{:.2f}",
+                            "p (empiris)": "{:.4f}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+                # Visual dumbbell: observasi vs pita null (mean ± 2SD)
+                fig_sig = go.Figure()
+                fig_sig.add_trace(
+                    go.Scatter(
+                        x=df_sig["Null Mean"],
+                        y=df_sig["Metrik"],
+                        mode="markers",
+                        marker=dict(size=9, color="#94A3B8"),
+                        error_x=dict(type="data", array=(2.0 * df_sig["Null SD"]).tolist(), color="#CBD5E1", thickness=6),
+                        name="Ekspektasi null (mean ± 2SD)",
+                    )
+                )
+                fig_sig.add_trace(
+                    go.Scatter(
+                        x=df_sig["Observasi"],
+                        y=df_sig["Metrik"],
+                        mode="markers",
+                        marker=dict(symbol="diamond", size=13, color="#DC2626", line=dict(color="#7F1D1D", width=1)),
+                        name="Nilai observasi",
+                    )
+                )
+                style_publication_figure(
+                    fig_sig,
+                    title="Observasi vs Ekspektasi Null Model",
+                    height=max(360, 90 + 52 * len(df_sig)),
+                    xaxis_title="Nilai metrik",
+                    yaxis_title="",
+                    showlegend=True,
+                    legend_title="",
+                )
+                st.plotly_chart(fig_sig, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                st.caption(
+                    "Homofili diuji dengan permutasi atribut node (label dikocok, struktur tetap); modularitas diuji "
+                    "dengan rewiring degree-preserving (struktur diacak, distribusi derajat tetap; Maslov & Sneppen "
+                    "2002). p empiris dua sisi = (1 + jumlah null seekstrem observasi) / (jumlah replikasi + 1). "
+                    "Titik berlian yang keluar dari pita abu-abu berarti sinyal nyata, bukan artefak acak."
+                )
+            else:
+                st.info("Uji signifikansi belum tersedia untuk konfigurasi ini.")
+
+            # --- (3) Stabilitas Louvain lintas seed ---
+            st.markdown("<b>Stabilitas Louvain Lintas Seed</b>", unsafe_allow_html=True)
+            sb1, sb2, sb3 = st.columns(3)
+            q_mean = _safe_float_metric(diag_journal.get("q_seed_mean"), default=np.nan)
+            q_std = _safe_float_metric(diag_journal.get("q_seed_std"), default=np.nan)
+            nmi_mean = _safe_float_metric(diag_journal.get("nmi_mean"), default=np.nan)
+            sb1.metric(
+                "Modularitas lintas seed",
+                f"{q_mean:.3f} ± {q_std:.3f}" if np.isfinite(q_mean) and np.isfinite(q_std) else "n/a",
+                help=f"Rata-rata ± SD dari {int(diag_journal.get('n_seeds_efektif', 0))} run Louvain dengan seed berbeda.",
+            )
+            sb2.metric(
+                "Jumlah klaster lintas seed",
+                f"{int(diag_journal.get('k_seed_min', 0))}–{int(diag_journal.get('k_seed_max', 0))}",
+                help="Rentang jumlah komunitas antar seed; rentang sempit = struktur stabil.",
+            )
+            sb3.metric(
+                "NMI vs partisi utama",
+                f"{nmi_mean:.3f}" if np.isfinite(nmi_mean) else "n/a",
+                help="Normalized Mutual Information rata-rata terhadap partisi yang dilaporkan; mendekati 1 = partisi hampir identik.",
+            )
+
+            # --- Insight otomatis ---
+            insight_bits = []
+            if sig_rows_journal:
+                sig_names = [
+                    r["Metrik"] for r in sig_rows_journal
+                    if np.isfinite(_safe_float_metric(r.get("p (empiris)"), default=np.nan)) and r["p (empiris)"] < 0.05
+                ]
+                nonsig_names = [
+                    r["Metrik"] for r in sig_rows_journal
+                    if np.isfinite(_safe_float_metric(r.get("p (empiris)"), default=np.nan)) and r["p (empiris)"] >= 0.05
+                ]
+                if sig_names:
+                    insight_bits.append(
+                        "Signifikan terhadap null model (p<0,05): " + "; ".join(sig_names) + " — pola ini bukan artefak acak."
+                    )
+                if nonsig_names:
+                    insight_bits.append(
+                        "Tidak signifikan pada α=0,05: " + "; ".join(nonsig_names) + " — tafsirkan secara hati-hati."
+                    )
+            if np.isfinite(sigma_val):
+                insight_bits.append(
+                    f"Small-world sigma = {sigma_val:.2f} ({'terpenuhi' if sigma_val > 1.0 else 'tidak terpenuhi'}): "
+                    + ("clustering tinggi dengan jalur pendek — difusi program via aktor strategis efisien." if sigma_val > 1.0
+                       else "struktur belum menunjukkan sifat small-world yang tegas.")
+                )
+            if np.isfinite(nmi_mean):
+                insight_bits.append(
+                    f"Partisi Louvain {'sangat stabil' if nmi_mean >= 0.8 else 'cukup stabil' if nmi_mean >= 0.6 else 'kurang stabil'} "
+                    f"lintas seed (NMI rata-rata {nmi_mean:.2f})."
+                )
+            if insight_bits:
+                st.info(" ".join(insight_bits))
+            st.caption(
+                "Catatan metodologis: modularitas diuji pada struktur tanpa bobot agar sebanding dengan null model "
+                "rewiring; nilai Q berbobot pada Temuan Kunci 1 tetap menjadi angka utama yang dilaporkan. "
+                "Interpretasi jumlah komunitas juga mempertimbangkan resolution limit modularitas "
+                "(Fortunato & Barthélemy, 2007)."
+            )
+
+    # ============================================================
+    # 13. ROBUSTNESS / SENSITIVITY (RIGOR METODOLOGIS)
+    # ============================================================
+    with subbab_dropdown("12. Robustness — Sensitivitas Threshold (untuk menjawab reviewer)", expanded=False):
         sens = meta.get("threshold_sensitivity") or meta.get("threshold_distribution") or []
         df_sens = pd.DataFrame(sens)
         if not df_sens.empty and "threshold" in df_sens.columns:
@@ -7706,7 +8093,7 @@ def render_journal_q1_page(
     # ============================================================
     # 13. IMPLIKASI KEBIJAKAN & POSITIONING JURNAL
     # ============================================================
-    with subbab_dropdown("12. Implikasi Kebijakan dan Positioning Jurnal Q1", expanded=False):
+    with subbab_dropdown("13. Implikasi Kebijakan dan Positioning Jurnal Q1", expanded=False):
         st.markdown(
             "<b>Implikasi kebijakan.</b>"
             "<ul>"
@@ -7739,7 +8126,7 @@ def render_journal_q1_page(
                 "Kontribusi yang Ditonjolkan": "Pipeline SNA end-to-end yang reprodusibel: konstruksi graf kemiripan multi-metrik, "
                 "penentuan threshold otomatis + uji sensitivitas, deteksi komunitas Louvain, dan klasifikasi peran aktor "
                 "multi-metrik berbasis kuartil (nonparametrik, robust terhadap distribusi heavy-tailed).",
-                "Subbab Pendukung": "2 (Metodologi), 8 (Aktor Strategis), 10 (Robustness)",
+                "Subbab Pendukung": "2 (Metodologi), 8 (Aktor Strategis), 11 (Diagnostik & Signifikansi), 12 (Robustness)",
             },
             {
                 "Bidang/Scope": "Ilmu Sosial / Kebijakan Publik",
@@ -7753,7 +8140,7 @@ def render_journal_q1_page(
                 "Kontribusi yang Ditonjolkan": "Menjembatani data administratif Data Desa Presisi dengan indikator relasional "
                 "kebijakan: dari data mikro rumah tangga menjadi bukti struktural (jaringan, komunitas, spasial) yang "
                 "dapat ditindaklanjuti pemerintah desa — kerangka yang dapat direplikasi lintas desa.",
-                "Subbab Pendukung": "1 (Novelty), 3 (Struktur), 11 (Implikasi)",
+                "Subbab Pendukung": "1 (Novelty), 3 (Struktur), 13 (Implikasi)",
             },
         ]
         st.dataframe(pd.DataFrame(scope_rows), use_container_width=True, hide_index=True)
@@ -7763,8 +8150,9 @@ def render_journal_q1_page(
             "<ul>"
             "<li><b>Novelty eksplisit</b>: dekomposisi within-between + audit targeting berbasis jaringan pada data "
             "sensus desa presisi (bukan sampel survei).</li>"
-            "<li><b>Rigor &amp; robustness</b>: threshold otomatis dengan uji sensitivitas (subbab 10) dan justifikasi "
-            "metodologis ambang kuartil peran aktor (subbab 8).</li>"
+            "<li><b>Rigor &amp; robustness</b>: uji signifikansi null model dan stabilitas seed Louvain (subbab 11), "
+            "threshold otomatis dengan uji sensitivitas (subbab 12), dan justifikasi metodologis ambang kuartil "
+            "peran aktor (subbab 8).</li>"
             "<li><b>Reprodusibilitas</b>: parameter lengkap dilaporkan (basis fitur, metrik kemiripan, threshold, "
             "seed Louvain); pipeline dapat dijalankan ulang pada data yang sama.</li>"
             "<li><b>Etika data</b>: anonimisasi node/dusun, hasil agregat, pernyataan batasan interpretasi di setiap "
@@ -7797,7 +8185,11 @@ def render_journal_q1_page(
             "Guimer&agrave;, R. &amp; Amaral, L.A.N. (2005). Functional cartography of complex metabolic networks. <i>Nature</i>, 433 — taksonomi peran node berbasis ambang statistik.<br>"
             "Costenbader, E. &amp; Valente, T.W. (2003). The stability of centrality measures... <i>Social Networks</i>.<br>"
             "Duncan, O.D. &amp; Duncan, B. (1955). A methodological analysis of segregation indexes. <i>Am. Sociol. Rev.</i> — indeks disimilaritas.<br>"
-            "Tukey, J.W. (1977). <i>Exploratory Data Analysis</i> — konvensi kuartil.",
+            "Tukey, J.W. (1977). <i>Exploratory Data Analysis</i> — konvensi kuartil.<br>"
+            "Watts, D.J. &amp; Strogatz, S.H. (1998). Collective dynamics of 'small-world' networks. <i>Nature</i>, 393 — sifat small-world.<br>"
+            "Humphries, M.D. &amp; Gurney, K. (2008). Network 'small-world-ness'. <i>PLOS ONE</i> — indeks sigma.<br>"
+            "Maslov, S. &amp; Sneppen, K. (2002). Specificity and stability in topology of protein networks. <i>Science</i>, 296 — null model rewiring degree-preserving.<br>"
+            "Fortunato, S. &amp; Barth&eacute;lemy, M. (2007). Resolution limit in community detection. <i>PNAS</i>, 104 — batasan interpretasi modularitas.",
             unsafe_allow_html=True,
         )
         st.caption(

@@ -6390,6 +6390,224 @@ def build_sna_network(
     return G_target, partition, sorted(list(set(reorder_map.values()))), meta
 
 
+# ============================================================
+# Helper visual untuk Ringkasan Jurnal Q1
+# ============================================================
+JOURNAL_WELFARE_ICON = {
+    "Rendah": "🏚️",
+    "Sedang": "🏠",
+    "Tinggi": "🏡",
+    "Sangat Tinggi": "🏘️",
+}
+JOURNAL_TARGETING_ICON = {
+    "Tepat sasaran (rentan menerima)": "✅",
+    "Exclusion error (rentan belum menerima)": "⚠️",
+    "Inclusion error (mampu menerima)": "❗",
+    "Sesuai (mampu tidak menerima)": "🏠",
+    "Tidak tervalidasi": "▫️",
+}
+JOURNAL_TARGETING_COLOR = {
+    "Tepat sasaran (rentan menerima)": "#16A34A",
+    "Exclusion error (rentan belum menerima)": "#DC2626",
+    "Inclusion error (mampu menerima)": "#F59E0B",
+    "Sesuai (mampu tidak menerima)": "#2563EB",
+    "Tidak tervalidasi": "#94A3B8",
+}
+JOURNAL_WELFARE_COLOR = {
+    "Rendah": "#DC2626",
+    "Sedang": "#F59E0B",
+    "Tinggi": "#16A34A",
+    "Sangat Tinggi": "#2563EB",
+}
+
+
+def _journal_targeting_label(status_bps, status_bansos):
+    strata = str(status_bps or "").strip().lower()
+    penerima = str(status_bansos or "").strip().lower() == "penerima"
+    if strata in {"rendah", "sedang"}:
+        return "Tepat sasaran (rentan menerima)" if penerima else "Exclusion error (rentan belum menerima)"
+    if strata in {"tinggi", "sangat tinggi"}:
+        return "Inclusion error (mampu menerima)" if penerima else "Sesuai (mampu tidak menerima)"
+    return "Tidak tervalidasi"
+
+
+def build_journal_spatial_dataframe(graph_obj, df_role_journal):
+    """Gabungkan koordinat node (lat/lng) dengan atribut peran/kesejahteraan untuk peta ikon jurnal."""
+    if df_role_journal is None or df_role_journal.empty or "family_id" not in df_role_journal.columns:
+        return pd.DataFrame(), None, None
+    sample_cols = set()
+    for n in graph_obj.nodes():
+        sample_cols.update(graph_obj.nodes[n].keys())
+        break
+    lat_col, lon_col = detect_lat_lon_columns(sample_cols)
+    if not lat_col or not lon_col:
+        return pd.DataFrame(), None, None
+    rows = []
+    lookup = df_role_journal.set_index("family_id")
+    for n in graph_obj.nodes():
+        if n not in lookup.index:
+            continue
+        lat_v = _safe_float_metric(graph_obj.nodes[n].get(lat_col), default=np.nan)
+        lon_v = _safe_float_metric(graph_obj.nodes[n].get(lon_col), default=np.nan)
+        if not (np.isfinite(lat_v) and np.isfinite(lon_v)):
+            continue
+        row = lookup.loc[n]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        status_bps = str(row.get("Status BPS", "-"))
+        status_bansos = str(row.get("Status Bansos", "-"))
+        targeting = _journal_targeting_label(status_bps, status_bansos)
+        rows.append(
+            {
+                "lat": float(lat_v),
+                "lon": float(lon_v),
+                "Kode Node": str(row.get("Kode Node", "N-000")),
+                "Klaster": f"Klaster {int(row.get('Klaster Louvain', -1))}" if pd.notnull(row.get("Klaster Louvain")) else "Klaster -",
+                "Status BPS": status_bps,
+                "Status Bansos": status_bansos,
+                "Kategori Kesejahteraan": status_bps if status_bps in JOURNAL_WELFARE_ICON else "Tidak tervalidasi",
+                "Ketepatan Sasaran": targeting,
+                "Hover Aman": str(row.get("Hover Aman", f"Kode Node: {row.get('Kode Node', 'N-000')}")),
+            }
+        )
+    return pd.DataFrame(rows), "lat", "lon"
+
+
+def build_journal_icon_map(df_spatial, category_col, icon_map, color_map, category_order, title, spatial_mode="Spasial ArcGIS"):
+    """Peta spasial interaktif berbasis ikon emoji (bukan titik) — tetap bisa di-hover/klik/zoom."""
+    if df_spatial is None or df_spatial.empty:
+        return None
+    plot_df = df_spatial[df_spatial["lat"].notna() & df_spatial["lon"].notna()].copy()
+    if plot_df.empty:
+        return None
+    uniq = plot_df[category_col].astype(str).unique().tolist()
+    ordered = [c for c in category_order if c in uniq] + sorted([c for c in uniq if c not in category_order])
+    fig = go.Figure()
+    for category in ordered:
+        sub = plot_df[plot_df[category_col].astype(str) == category]
+        if sub.empty:
+            continue
+        icon = icon_map.get(category, "▫️")
+        color = color_map.get(category, "#64748B")
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=sub["lat"],
+                lon=sub["lon"],
+                mode="markers+text",
+                marker=dict(size=20, color=color, opacity=0.55),
+                text=[icon] * len(sub),
+                textposition="middle center",
+                textfont=dict(size=15),
+                hovertext=[f"{icon} {category}<br>{h}" for h in sub["Hover Aman"]],
+                hoverinfo="text",
+                name=f"{icon} {category}",
+            )
+        )
+    mapbox_cfg = dict(
+        zoom=13,
+        center=dict(lat=float(plot_df["lat"].mean()), lon=float(plot_df["lon"].mean())),
+    )
+    if spatial_mode == "Spasial ArcGIS":
+        mapbox_cfg["style"] = "white-bg"
+        mapbox_cfg["layers"] = [
+            {
+                "sourcetype": "raster",
+                "source": ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+                "below": "traces",
+            }
+        ]
+    else:
+        mapbox_cfg["style"] = "open-street-map"
+    fig.update_layout(
+        title=dict(text=title, x=0.02, xanchor="left"),
+        height=600,
+        template=PUBLICATION_TEMPLATE,
+        margin=dict(l=10, r=10, t=58, b=10),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=0.01, xanchor="left", x=0.01,
+            bgcolor="rgba(255,255,255,0.88)", font=dict(size=11),
+        ),
+        mapbox=mapbox_cfg,
+    )
+    return fig
+
+
+def render_journal_network_figure(graph_obj, partition, df_role_journal, layout_spread=2.2):
+    """Jaringan Louvain interaktif untuk jurnal: warna = klaster, ikon bintang = aktor strategis. Tetap bisa di-hover/klik/zoom."""
+    node_ids = list(graph_obj.nodes())
+    if not node_ids or df_role_journal is None or df_role_journal.empty:
+        return None
+    pos = build_clustered_network_layout(graph_obj, partition=partition, layout_spread=layout_spread, seed=42)
+    lookup = df_role_journal.set_index("family_id")
+    node_order = [n for n in node_ids if n in pos and n in lookup.index]
+    if not node_order:
+        return None
+    degrees = dict(graph_obj.degree())
+    deg_vals = np.array([float(degrees.get(n, 0)) for n in node_order], dtype=float)
+    size_vals = centrality_marker_sizes(deg_vals, len(node_order))
+    size_lookup = {n: size_vals[idx] for idx, n in enumerate(node_order)}
+
+    edge_weights = [_safe_float_metric(d.get("weight"), default=0.0) for _, _, d in graph_obj.edges(data=True)]
+    edge_min = float(min(edge_weights)) if edge_weights else 0.0
+    edge_max = float(max(edge_weights)) if edge_weights else 1.0
+    edge_span = max(edge_max - edge_min, 1e-9)
+    visible_edges = select_representative_edges(
+        graph_obj, max_edges=int(np.clip(graph_obj.number_of_nodes() * 1.25, 120, 650)), per_node=1
+    )
+    fig = go.Figure()
+    add_network_edge_traces(
+        fig, visible_edges, pos, edge_min, edge_span,
+        color_fn=lambda *_a, **_k: "rgba(148, 163, 184, 0.22)",
+        base_width=0.26, width_scale=0.72, hover=False,
+    )
+    clusters = sorted({int(partition.get(n, -1)) for n in node_order})
+    for idx, c in enumerate(clusters):
+        c_nodes = [n for n in node_order if int(partition.get(n, -1)) == c]
+        if not c_nodes:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=[pos[n][0] for n in c_nodes],
+                y=[pos[n][1] for n in c_nodes],
+                mode="markers",
+                marker=dict(
+                    size=[size_lookup.get(n, 8.0) for n in c_nodes],
+                    color=CONTRAST_COLORS[idx % len(CONTRAST_COLORS)],
+                    opacity=0.82,
+                    line=dict(color=NETWORK_NODE_LINE, width=0.5),
+                ),
+                text=[str(lookup.loc[n, "Hover Aman"]) for n in c_nodes],
+                hoverinfo="text",
+                name=f"Klaster {c}",
+            )
+        )
+    # Overlay ikon bintang untuk aktor strategis (bukan titik biasa)
+    actor_nodes = [
+        n for n in node_order
+        if str(lookup.loc[n, "Peran Struktural"]) != "Node umum"
+    ] if "Peran Struktural" in lookup.columns else []
+    if actor_nodes:
+        fig.add_trace(
+            go.Scatter(
+                x=[pos[n][0] for n in actor_nodes],
+                y=[pos[n][1] for n in actor_nodes],
+                mode="markers",
+                marker=dict(
+                    symbol="star",
+                    size=[size_lookup.get(n, 10.0) + 6.0 for n in actor_nodes],
+                    color="#FACC15",
+                    opacity=0.95,
+                    line=dict(color="#1E293B", width=1.0),
+                ),
+                text=[str(lookup.loc[n, "Hover Aman"]) for n in actor_nodes],
+                hoverinfo="text",
+                name="★ Aktor strategis",
+            )
+        )
+    style_network_figure(fig, title="Jaringan Kemiripan IKD (warna = klaster, ★ = aktor strategis)", height=640, showlegend=True)
+    return fig
+
+
 def render_journal_q1_page(
     graph_obj,
     partition,
@@ -6799,6 +7017,57 @@ def render_journal_q1_page(
             unsafe_allow_html=True,
         )
 
+        # Visualisasi jaringan interaktif (bukan gambar statis — bisa di-hover, zoom, klik)
+        st.markdown("<b>Visualisasi Jaringan Kemiripan IKD (Interaktif)</b>", unsafe_allow_html=True)
+        fig_journal_net = render_journal_network_figure(G, partition, df_role_journal)
+        if fig_journal_net is not None:
+            st.plotly_chart(fig_journal_net, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            st.caption(
+                "Setiap simpul adalah satu KK; warna menandai komunitas Louvain, ukuran mengikuti derajat "
+                "(jumlah relasi), dan ikon bintang ★ menandai aktor strategis. Grafik ini interaktif "
+                "(arahkan kursor untuk detail anonim, zoom, dan geser) — bukan gambar statis."
+            )
+        else:
+            st.info("Visualisasi jaringan belum dapat dibentuk untuk graf saat ini.")
+
+        # Distribusi data: derajat jaringan & IKD agregat per kategori BPS
+        st.markdown("<b>Distribusi Data</b>", unsafe_allow_html=True)
+        dist1, dist2 = st.columns(2)
+        with dist1:
+            deg_series = pd.Series([int(d) for _, d in G.degree()], name="Derajat")
+            if not deg_series.empty:
+                fig_deg = px.histogram(deg_series, x="Derajat", nbins=min(30, max(8, int(deg_series.max()) or 8)))
+                fig_deg.update_traces(marker_color="#2563EB", marker_line_color="#FFFFFF", marker_line_width=0.5)
+                style_publication_figure(
+                    fig_deg, title="Distribusi Derajat (Degree) Jaringan", height=340,
+                    xaxis_title="Derajat node (jumlah relasi)", yaxis_title="Jumlah KK", showlegend=False,
+                )
+                st.plotly_chart(fig_deg, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        with dist2:
+            if not df_role_journal.empty and "IKD Agregat" in df_role_journal.columns:
+                dist_ikd = df_role_journal.copy()
+                dist_ikd["IKD Agregat"] = pd.to_numeric(dist_ikd["IKD Agregat"], errors="coerce")
+                dist_ikd = dist_ikd.dropna(subset=["IKD Agregat"])
+                if not dist_ikd.empty:
+                    fig_ikd = px.histogram(
+                        dist_ikd, x="IKD Agregat", color="Status BPS", nbins=24,
+                        color_discrete_map=JOURNAL_WELFARE_COLOR,
+                        category_orders={"Status BPS": ["Rendah", "Sedang", "Tinggi", "Sangat Tinggi"]},
+                    )
+                    for xline, lbl in [(60, "60"), (70, "70"), (80, "80")]:
+                        fig_ikd.add_vline(x=xline, line_width=1, line_dash="dot", line_color="#94A3B8")
+                    style_publication_figure(
+                        fig_ikd, title="Distribusi IKD Agregat menurut Strata BPS", height=340,
+                        xaxis_title="Skor IKD agregat (garis: ambang 60/70/80)", yaxis_title="Jumlah KK",
+                        legend_title="Strata BPS",
+                    )
+                    st.plotly_chart(fig_ikd, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        st.caption(
+            "Distribusi derajat memperlihatkan pola <i>heavy-tailed</i> khas jaringan sosial (sedikit node "
+            "berderajat sangat tinggi), yang mendasari pemakaian ambang kuartil pada pemetaan aktor. Distribusi "
+            "IKD memetakan sebaran kesejahteraan terhadap ambang strata BPS (60/70/80)."
+        )
+
     # ============================================================
     # 6. TEMUAN 2 — HOMOFILI KESEJAHTERAAN (ASSORTATIVITY)
     # ============================================================
@@ -7141,6 +7410,55 @@ def render_journal_q1_page(
             sp2.metric("Assortativity Dusun (r)", r_dusun_txt, help="Newman (2003): positif = relasi cenderung terkurung dalam dusun (segregasi spasial).")
             sp3.metric("Duncan D — Bansos", d_bansos_txt, help="Duncan & Duncan (1955): 0 = penerima bansos tersebar merata antar dusun, 1 = terpisah total.")
             sp4.metric("Duncan D — KK Rentan", d_rendah_txt, help="Segregasi spasial KK kategori Rendah/Sedang antar dusun.")
+
+            # Peta spasial berbasis ikon (koordinat asli, basemap ArcGIS/OSM) — interaktif, bukan gambar statis
+            df_spatial_journal, _lat_j, _lon_j = build_journal_spatial_dataframe(G, df_role_journal)
+            if not df_spatial_journal.empty:
+                st.markdown("<b>Peta Spasial Rumah Tangga (Ikon Representatif, Interaktif)</b>", unsafe_allow_html=True)
+                map_col1, map_col2 = st.columns([2, 1])
+                with map_col2:
+                    spatial_repr = st.radio(
+                        "Representasi ikon",
+                        ["Kategori Kesejahteraan (IKD)", "Ketepatan Sasaran Bansos"],
+                        key="journal_spatial_repr",
+                        help="Ganti makna ikon pada peta. Peta tetap interaktif (hover, zoom, geser).",
+                    )
+                    spatial_basemap = st.radio(
+                        "Basemap",
+                        ["Spasial ArcGIS", "Spasial OSM"],
+                        key="journal_spatial_basemap",
+                        help="ArcGIS = citra satelit; OSM = peta jalan OpenStreetMap.",
+                    )
+                if spatial_repr == "Kategori Kesejahteraan (IKD)":
+                    cat_col = "Kategori Kesejahteraan"
+                    icon_map = JOURNAL_WELFARE_ICON
+                    color_map = JOURNAL_WELFARE_COLOR
+                    cat_order = ["Rendah", "Sedang", "Tinggi", "Sangat Tinggi"]
+                    map_title = "Sebaran Kesejahteraan (IKD) — 🏚️ Rendah · 🏠 Sedang · 🏡 Tinggi · 🏘️ Sangat Tinggi"
+                else:
+                    cat_col = "Ketepatan Sasaran"
+                    icon_map = JOURNAL_TARGETING_ICON
+                    color_map = JOURNAL_TARGETING_COLOR
+                    cat_order = [
+                        "Exclusion error (rentan belum menerima)",
+                        "Tepat sasaran (rentan menerima)",
+                        "Inclusion error (mampu menerima)",
+                        "Sesuai (mampu tidak menerima)",
+                    ]
+                    map_title = "Ketepatan Sasaran Bansos — ⚠️ Exclusion · ✅ Tepat · ❗ Inclusion · 🏠 Sesuai"
+                fig_icon_map = build_journal_icon_map(
+                    df_spatial_journal, cat_col, icon_map, color_map, cat_order, map_title, spatial_mode=spatial_basemap,
+                )
+                with map_col1:
+                    if fig_icon_map is not None:
+                        st.plotly_chart(fig_icon_map, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                    else:
+                        st.info("Peta ikon belum dapat dibentuk (koordinat tidak tersedia).")
+                st.caption(
+                    "Setiap ikon adalah satu rumah tangga pada koordinat aslinya (dianonimkan pada hover). Ikon "
+                    "kondisi rumah merepresentasikan strata kesejahteraan; mode ketepatan sasaran menyorot "
+                    "⚠️ exclusion error sebagai prioritas verifikasi. Peta tetap interaktif — bukan gambar statis."
+                )
 
             # Sebaran komunitas Louvain antar dusun
             if not df_mix_dusun_journal.empty:

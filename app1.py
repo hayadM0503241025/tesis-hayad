@@ -2007,8 +2007,8 @@ def render_centrality_quartile_visual(df_view):
     st.plotly_chart(fig_quartile, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
 
 
-def render_centrality_role_legend_table():
-    legend_df = pd.DataFrame(
+def build_centrality_role_legend_df():
+    return pd.DataFrame(
         [
             {
                 "Peran Aktor": role,
@@ -2018,11 +2018,14 @@ def render_centrality_role_legend_table():
             for role in CENTRALITY_ROLE_ORDER
         ]
     )
+
+
+def render_centrality_role_legend_table():
     with st.expander("Keterangan Peran Aktor", expanded=False):
-        st.dataframe(legend_df, use_container_width=True, hide_index=True)
+        st.dataframe(build_centrality_role_legend_df(), use_container_width=True, hide_index=True)
 
 
-def render_role_composition_charts(df_view, publish_mode=True):
+def render_role_composition_charts(df_view, publish_mode=True, include_legend=True):
     role_cluster_df = build_role_composition_summary(df_view, "Klaster Louvain")
     role_dusun_col = "Dusun/Kode Dusun" if publish_mode else "Dusun"
     role_dusun_df = build_role_composition_summary(df_view, role_dusun_col)
@@ -2050,7 +2053,8 @@ def render_role_composition_charts(df_view, publish_mode=True):
             )
             st.plotly_chart(fig_role_dusun, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
     render_centrality_quartile_visual(df_view)
-    render_centrality_role_legend_table()
+    if include_legend:
+        render_centrality_role_legend_table()
 
 
 def render_strategic_actor_centrality_map(df_view):
@@ -6490,6 +6494,98 @@ def render_journal_q1_page(
         pct_strategic = 0.0
         strategic_txt = "n/a"
 
+    # Analisis spasial sebaran jaringan per dusun (dipakai abstrak dan Temuan Kunci 7)
+    df_dusun_journal = pd.DataFrame()
+    df_mix_dusun_journal = pd.DataFrame()
+    intra_dusun_share = np.nan
+    r_dusun = np.nan
+    dissim_bansos = np.nan
+    dissim_rendah = np.nan
+    spatial_abstract_txt = ""
+    if not df_role_journal.empty and "Dusun/Kode Dusun" in df_role_journal.columns:
+        work_spasial = df_role_journal.copy()
+        work_spasial["_dusun"] = work_spasial["Dusun/Kode Dusun"].fillna("Tidak tersedia").astype(str)
+        if work_spasial["_dusun"].nunique() > 1:
+            # Kohesi spasial: proporsi edge yang terbentuk di dalam dusun yang sama
+            node_dusun_map = dict(zip(work_spasial["family_id"].astype(str), work_spasial["_dusun"]))
+            same_dusun_edges = 0
+            counted_edges = 0
+            for edge_u, edge_v in G.edges():
+                dusun_u = node_dusun_map.get(str(edge_u))
+                dusun_v = node_dusun_map.get(str(edge_v))
+                if dusun_u is None or dusun_v is None:
+                    continue
+                counted_edges += 1
+                if dusun_u == dusun_v:
+                    same_dusun_edges += 1
+            if counted_edges > 0:
+                intra_dusun_share = float(same_dusun_edges) / float(counted_edges)
+            try:
+                r_dusun = float(nx.attribute_assortativity_coefficient(G, dusun_attr_journal))
+            except Exception:
+                r_dusun = np.nan
+
+            # Indeks disimilaritas Duncan & Duncan (1955): segregasi spasial bansos & kategori rentan
+            def _duncan_dissimilarity(mask):
+                grp_a = work_spasial[mask].groupby("_dusun").size()
+                grp_b = work_spasial[~mask].groupby("_dusun").size()
+                total_a = float(grp_a.sum())
+                total_b = float(grp_b.sum())
+                if total_a <= 0 or total_b <= 0:
+                    return np.nan
+                all_dusun = sorted(set(grp_a.index) | set(grp_b.index))
+                return 0.5 * float(
+                    sum(abs(grp_a.get(d, 0) / total_a - grp_b.get(d, 0) / total_b) for d in all_dusun)
+                )
+
+            mask_bansos = work_spasial["Status Bansos"].eq("Penerima")
+            mask_rendah = (
+                work_spasial["Status BPS"].astype(str).str.strip().str.lower().isin(["rendah", "sedang"])
+            )
+            dissim_bansos = _duncan_dissimilarity(mask_bansos)
+            dissim_rendah = _duncan_dissimilarity(mask_rendah)
+
+            # Profil per dusun: kesejahteraan, cakupan bansos, exclusion error, aktor strategis
+            rows_dusun = []
+            for dusun_name, sub_dusun in work_spasial.groupby("_dusun"):
+                low_mask = sub_dusun["Status BPS"].astype(str).str.strip().str.lower().isin(["rendah", "sedang"])
+                n_low = int(low_mask.sum())
+                excl_dusun = (
+                    float((sub_dusun.loc[low_mask, "Status Bansos"] != "Penerima").mean()) if n_low > 0 else np.nan
+                )
+                rerata_ikd = pd.to_numeric(sub_dusun["IKD Agregat"], errors="coerce").mean()
+                rows_dusun.append(
+                    {
+                        "Dusun/Kode Dusun": dusun_name,
+                        "Jumlah KK": int(len(sub_dusun)),
+                        "Rerata IKD Agregat": float(rerata_ikd) if np.isfinite(_safe_float_metric(rerata_ikd, default=np.nan)) else np.nan,
+                        "Kategori Rendah/Sedang (%)": 100.0 * float(low_mask.mean()),
+                        "Penerima Bansos (%)": 100.0 * float(sub_dusun["Status Bansos"].eq("Penerima").mean()),
+                        "Exclusion Error Dusun (%)": 100.0 * excl_dusun if np.isfinite(_safe_float_metric(excl_dusun, default=np.nan)) else np.nan,
+                        "Aktor Strategis": int(sub_dusun["Peran Struktural"].ne("Node umum").sum()),
+                        "Jumlah Klaster Hadir": int(sub_dusun["Klaster Louvain"].nunique()),
+                    }
+                )
+            df_dusun_journal = pd.DataFrame(rows_dusun).sort_values("Jumlah KK", ascending=False).reset_index(drop=True)
+
+            # Komposisi klaster per dusun (sebaran spasial komunitas)
+            df_mix_dusun_journal = (
+                work_spasial.groupby(["_dusun", "Klaster Louvain"], as_index=False)
+                .size()
+                .rename(columns={"size": "Jumlah KK", "_dusun": "Dusun/Kode Dusun"})
+            )
+            df_mix_dusun_journal["Klaster"] = df_mix_dusun_journal["Klaster Louvain"].map(lambda v: f"Klaster {int(v)}")
+
+            if np.isfinite(_safe_float_metric(intra_dusun_share, default=np.nan)):
+                spatial_abstract_txt = (
+                    f"Secara spasial, <b>{intra_dusun_share:.0%}</b> edge terbentuk di dalam dusun yang sama"
+                )
+                if np.isfinite(_safe_float_metric(r_dusun, default=np.nan)):
+                    spatial_abstract_txt += f" (assortativity dusun r=<b>{r_dusun:.3f}</b>)"
+                if np.isfinite(_safe_float_metric(dissim_bansos, default=np.nan)):
+                    spatial_abstract_txt += f"; indeks disimilaritas Duncan penerima bansos D=<b>{dissim_bansos:.2f}</b>"
+                spatial_abstract_txt += ". "
+
     # Penargetan bansos: exclusion/inclusion error berbasis kategori kesejahteraan
     excl_rate = np.nan
     incl_rate = np.nan
@@ -6550,6 +6646,7 @@ def render_journal_q1_page(
         f"menandai <b>{strategic_txt}</b> aktor strategis ({pct_strategic:.1f}% node), terdiri atas "
         f"<b>{n_role_multi}</b> aktor multiperan, <b>{n_role_core}</b> aktor sentral berpengaruh, dan "
         f"<b>{n_role_broker}</b> broker antar-kelompok. "
+        f"{spatial_abstract_txt}"
         f"<b>Implikasi.</b> Struktur relasional desa memberi lapisan bukti baru untuk memperbaiki "
         f"akurasi penargetan bantuan sosial, pemerataan inklusi digital, serta pemilihan aktor strategis "
         f"sebagai agen difusi program."
@@ -6917,9 +7014,38 @@ def render_journal_q1_page(
                     "agen difusi yang dekat dengan kelompok sasaran."
                 )
 
-            # Komposisi peran per klaster & dusun + kuartil + legenda peran
+            # Komposisi peran per klaster & dusun + kuartil (legenda dirender inline
+            # karena subbab ini sudah berupa expander — expander tidak boleh bersarang)
             st.markdown("<b>Komposisi Aktor Strategis per Klaster dan Dusun</b>", unsafe_allow_html=True)
-            render_role_composition_charts(df_role_journal, publish_mode=True)
+            render_role_composition_charts(df_role_journal, publish_mode=True, include_legend=False)
+            st.markdown("<b>Keterangan Peran Aktor</b>", unsafe_allow_html=True)
+            st.dataframe(build_centrality_role_legend_df(), use_container_width=True, hide_index=True)
+
+            # Dasar metodologis ambang kuartil (justifikasi untuk reviewer Q1)
+            st.markdown(
+                "<b>Dasar metodologis pembagian peran dengan ambang kuartil (&ge;Q75).</b>"
+                "<ul>"
+                "<li><b>Robust terhadap distribusi condong.</b> Distribusi metrik centrality pada jaringan sosial "
+                "umumnya sangat condong (<i>heavy-tailed</i>): sedikit node bernilai sangat tinggi, mayoritas rendah. "
+                "Ambang berbasis kuartil (kuartil atas, &ge;Q75) adalah pemisah nonparametrik yang tahan pencilan, "
+                "mengikuti konvensi eksplorasi data Tukey (1977) — berbeda dari ambang absolut yang arbitrer.</li>"
+                "<li><b>Relatif terhadap jaringan yang diamati.</b> Nilai centrality tidak dapat dibandingkan lintas "
+                "jaringan berbeda ukuran/densitas; ambang kuartil menstandardisasi 'tinggi' sebagai posisi relatif "
+                "dalam jaringan itu sendiri, sejalan dengan temuan stabilitas ukuran centrality "
+                "(Costenbader &amp; Valente, 2003).</li>"
+                "<li><b>Tradisi identifikasi aktor kunci.</b> Kerangka konseptual empat centrality merujuk Freeman "
+                "(1979); pemetaan aktor kunci untuk intervensi merujuk <i>key player problem</i> (Borgatti, 2006) "
+                "dan praktik pemilihan <i>opinion leader</i> difusi program (Valente &amp; Pumpuang, 2007; "
+                "Valente, 2012 — <i>network interventions</i>).</li>"
+                "<li><b>Taksonomi peran multi-metrik.</b> Penggabungan beberapa sinyal centrality menjadi peran "
+                "(multiperan, broker, penyebar cepat, hub, dekat inti) analog dengan kartografi peran node berbasis "
+                "ambang statistik pada Guimer&agrave; &amp; Amaral (2005): node diklasifikasikan menurut posisinya "
+                "terhadap distribusi metrik, bukan nilai mentahnya.</li>"
+                "<li><b>Pengaman teknis.</b> Label 'tinggi' hanya diberikan bila metrik memiliki sebaran "
+                "(max &gt; min); jaringan dengan metrik konstan tidak menghasilkan aktor strategis palsu.</li>"
+                "</ul>",
+                unsafe_allow_html=True,
+            )
             st.caption(
                 "Seluruh identitas disamarkan (Kode Node dan Kode Dusun). Peran aktor hanya membaca posisi jaringan "
                 "dari empat metrik centrality; bukan status sosial, tingkat kesejahteraan, atau kelayakan bantuan — "
@@ -6927,9 +7053,127 @@ def render_journal_q1_page(
             )
 
     # ============================================================
-    # 11. ROBUSTNESS / SENSITIVITY (RIGOR METODOLOGIS)
+    # 11. TEMUAN 7 — ANALISIS SPASIAL SEBARAN JARINGAN PER DUSUN
     # ============================================================
-    with subbab_dropdown("9. Robustness — Sensitivitas Threshold (untuk menjawab reviewer)", expanded=False):
+    with subbab_dropdown("9. Temuan Kunci 7 — Analisis Spasial: Sebaran Jaringan, Kesejahteraan, dan Bansos per Dusun", expanded=False):
+        if df_dusun_journal.empty:
+            st.info(
+                "Analisis spasial per dusun belum dapat disusun — data dusun tidak tersedia atau hanya ada satu "
+                "dusun pada jaringan aktif."
+            )
+        else:
+            st.markdown(
+                "Analisis ini membaca dimensi <b>spasial</b> jaringan pada level dusun (unit administratif): "
+                "seberapa besar relasi kemiripan kesejahteraan terkurung di dalam dusun, bagaimana komunitas "
+                "Louvain tersebar antar-dusun, di dusun mana KK rentan dan <i>exclusion error</i> terkonsentrasi, "
+                "serta di mana aktor strategis berada. Segregasi spasial diukur dengan proporsi edge intra-dusun, "
+                "assortativity atribut dusun (Newman, 2003), dan indeks disimilaritas Duncan &amp; Duncan (1955).",
+                unsafe_allow_html=True,
+            )
+            sp1, sp2, sp3, sp4 = st.columns(4)
+            intra_txt = f"{intra_dusun_share:.0%}" if np.isfinite(_safe_float_metric(intra_dusun_share, default=np.nan)) else "n/a"
+            r_dusun_txt = f"{r_dusun:.3f}" if np.isfinite(_safe_float_metric(r_dusun, default=np.nan)) else "n/a"
+            d_bansos_txt = f"{dissim_bansos:.2f}" if np.isfinite(_safe_float_metric(dissim_bansos, default=np.nan)) else "n/a"
+            d_rendah_txt = f"{dissim_rendah:.2f}" if np.isfinite(_safe_float_metric(dissim_rendah, default=np.nan)) else "n/a"
+            sp1.metric("Edge Intra-Dusun", intra_txt, help="Proporsi edge kemiripan yang menghubungkan dua KK dalam dusun yang sama.")
+            sp2.metric("Assortativity Dusun (r)", r_dusun_txt, help="Newman (2003): positif = relasi cenderung terkurung dalam dusun (segregasi spasial).")
+            sp3.metric("Duncan D — Bansos", d_bansos_txt, help="Duncan & Duncan (1955): 0 = penerima bansos tersebar merata antar dusun, 1 = terpisah total.")
+            sp4.metric("Duncan D — KK Rentan", d_rendah_txt, help="Segregasi spasial KK kategori Rendah/Sedang antar dusun.")
+
+            # Sebaran komunitas Louvain antar dusun
+            if not df_mix_dusun_journal.empty:
+                fig_mix_dusun = px.bar(
+                    df_mix_dusun_journal,
+                    x="Dusun/Kode Dusun",
+                    y="Jumlah KK",
+                    color="Klaster",
+                    barmode="stack",
+                    text="Jumlah KK",
+                )
+                fig_mix_dusun.update_traces(textposition="inside", insidetextanchor="middle", cliponaxis=False)
+                style_publication_figure(
+                    fig_mix_dusun,
+                    title="Sebaran Spasial Komunitas Louvain per Dusun",
+                    height=max(420, 340 + 14 * df_mix_dusun_journal["Dusun/Kode Dusun"].nunique()),
+                    xaxis_title="Dusun/Kode Dusun",
+                    yaxis_title="Jumlah KK",
+                    legend_title="Komunitas",
+                )
+                st.plotly_chart(fig_mix_dusun, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+
+            # Exclusion error per dusun (prioritas kewilayahan)
+            df_excl_dusun = df_dusun_journal.dropna(subset=["Exclusion Error Dusun (%)"]).copy()
+            if not df_excl_dusun.empty:
+                fig_excl_dusun = px.bar(
+                    df_excl_dusun.sort_values("Exclusion Error Dusun (%)", ascending=True),
+                    x="Exclusion Error Dusun (%)",
+                    y="Dusun/Kode Dusun",
+                    orientation="h",
+                    color="Exclusion Error Dusun (%)",
+                    color_continuous_scale="Reds",
+                    text=df_excl_dusun.sort_values("Exclusion Error Dusun (%)", ascending=True)["Exclusion Error Dusun (%)"].map(lambda v: f"{v:.0f}%"),
+                )
+                fig_excl_dusun.update_traces(textposition="outside", cliponaxis=False)
+                style_publication_figure(
+                    fig_excl_dusun,
+                    title="Exclusion Error Bansos per Dusun (KK Rendah/Sedang yang Belum Menerima)",
+                    height=max(380, 130 + 34 * len(df_excl_dusun)),
+                    xaxis_title="Exclusion error (%)",
+                    yaxis_title="",
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_excl_dusun, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+
+            # Tabel profil spasial per dusun
+            st.markdown("<b>Profil Spasial per Dusun</b>", unsafe_allow_html=True)
+            st.dataframe(
+                df_dusun_journal.style.format(
+                    {
+                        "Rerata IKD Agregat": "{:.2f}",
+                        "Kategori Rendah/Sedang (%)": "{:.1f}",
+                        "Penerima Bansos (%)": "{:.1f}",
+                        "Exclusion Error Dusun (%)": "{:.1f}",
+                    }
+                ).background_gradient(cmap="Reds", subset=["Exclusion Error Dusun (%)"]),
+                use_container_width=True,
+            )
+            st.download_button(
+                "Unduh Profil Spasial per Dusun (Anonim)",
+                data=df_dusun_journal.to_csv(index=False).encode("utf-8"),
+                file_name="profil_spasial_dusun_jurnal.csv",
+                mime="text/csv",
+                key="journal_spatial_dusun_download",
+            )
+
+            # Narasi spasial otomatis
+            spatial_sentences = []
+            if np.isfinite(_safe_float_metric(intra_dusun_share, default=np.nan)):
+                arah_spasial = "terkurung di dalam dusun" if intra_dusun_share >= 0.5 else "banyak menembus batas dusun"
+                spatial_sentences.append(
+                    f"Sebanyak {intra_dusun_share:.0%} edge kemiripan berada di dalam dusun yang sama, "
+                    f"sehingga struktur kesejahteraan relasional cenderung {arah_spasial}."
+                )
+            if not df_excl_dusun.empty:
+                worst_dusun = df_excl_dusun.sort_values("Exclusion Error Dusun (%)", ascending=False).iloc[0]
+                spatial_sentences.append(
+                    f"Exclusion error tertinggi berada di {worst_dusun['Dusun/Kode Dusun']} "
+                    f"({worst_dusun['Exclusion Error Dusun (%)']:.0f}% dari KK rentannya belum menerima bansos)."
+                )
+            top_actor_dusun = df_dusun_journal.sort_values("Aktor Strategis", ascending=False).iloc[0]
+            spatial_sentences.append(
+                f"Aktor strategis terbanyak berada di {top_actor_dusun['Dusun/Kode Dusun']} "
+                f"({int(top_actor_dusun['Aktor Strategis'])} aktor) — kandidat titik masuk difusi program berbasis wilayah."
+            )
+            st.info(" ".join(spatial_sentences))
+            st.caption(
+                "Kode dusun dianonimkan untuk publikasi. Analisis level dusun bersifat agregat administratif — "
+                "bukan koordinat presisi — sehingga aman etika data namun tetap informatif untuk prioritas kewilayahan."
+            )
+
+    # ============================================================
+    # 12. ROBUSTNESS / SENSITIVITY (RIGOR METODOLOGIS)
+    # ============================================================
+    with subbab_dropdown("10. Robustness — Sensitivitas Threshold (untuk menjawab reviewer)", expanded=False):
         sens = meta.get("threshold_sensitivity") or meta.get("threshold_distribution") or []
         df_sens = pd.DataFrame(sens)
         if not df_sens.empty and "threshold" in df_sens.columns:
@@ -6958,9 +7202,9 @@ def render_journal_q1_page(
             st.info("Data sensitivitas threshold belum tersedia untuk run ini (aktifkan mode threshold otomatis).")
 
     # ============================================================
-    # 12. IMPLIKASI KEBIJAKAN & POSITIONING JURNAL
+    # 13. IMPLIKASI KEBIJAKAN & POSITIONING JURNAL
     # ============================================================
-    with subbab_dropdown("10. Implikasi Kebijakan dan Positioning Jurnal Q1", expanded=False):
+    with subbab_dropdown("11. Implikasi Kebijakan dan Positioning Jurnal Q1", expanded=False):
         st.markdown(
             "<b>Implikasi kebijakan.</b>"
             "<ul>"
@@ -6969,6 +7213,9 @@ def render_journal_q1_page(
             f"<li>Efisiensi intervensi: manfaatkan aktor strategis hasil pemetaan empat centrality "
             f"({strategic_txt} node; {n_role_broker} broker antar-kelompok dan {n_role_multi} aktor multiperan) "
             "sebagai agen sosialisasi, verifikasi data, dan difusi program.</li>"
+            "<li>Prioritas kewilayahan: fokuskan verifikasi lapangan pada dusun dengan <i>exclusion error</i> "
+            "tertinggi (Temuan Kunci 7) dan libatkan aktor strategis yang berada di dusun tersebut sebagai "
+            "titik masuk program.</li>"
             "<li>Pemerataan digital: sasar kelompok dengan homofili digital tinggi agar kesenjangan tidak menetap.</li>"
             "</ul>",
             unsafe_allow_html=True,
@@ -6979,8 +7226,70 @@ def render_journal_q1_page(
             {"Temuan/Kontribusi": "Homofili & segregasi inklusi digital desa", "Angle": "ICT4D / digital divide", "Kandidat Jurnal Q1 (contoh)": "Telematics and Informatics; Information Technology for Development"},
             {"Temuan/Kontribusi": "Pipeline SNA Data Desa Presisi + robustness threshold", "Angle": "Metodologis/reprodusibilitas", "Kandidat Jurnal Q1 (contoh)": "PLOS ONE; Applied Network Science"},
             {"Temuan/Kontribusi": "Pemetaan peran aktor strategis empat centrality (ambang Q75) untuk agen difusi program", "Angle": "SNA terapan/kebijakan", "Kandidat Jurnal Q1 (contoh)": "Social Networks; Network Science; PLOS ONE"},
+            {"Temuan/Kontribusi": "Segregasi spasial jaringan & exclusion error per dusun (Duncan D, assortativity dusun)", "Angle": "Kebijakan/geografi sosial", "Kandidat Jurnal Q1 (contoh)": "World Development; Applied Geography; Social Indicators Research"},
         ]
         st.dataframe(pd.DataFrame(journal_rows), use_container_width=True, hide_index=True)
+
+        st.markdown("<b>Kontribusi menurut bidang ilmu (positioning lintas disiplin).</b>", unsafe_allow_html=True)
+        scope_rows = [
+            {
+                "Bidang/Scope": "Ilmu Komputer / Data Sains",
+                "Kontribusi yang Ditonjolkan": "Pipeline SNA end-to-end yang reprodusibel: konstruksi graf kemiripan multi-metrik, "
+                "penentuan threshold otomatis + uji sensitivitas, deteksi komunitas Louvain, dan klasifikasi peran aktor "
+                "multi-metrik berbasis kuartil (nonparametrik, robust terhadap distribusi heavy-tailed).",
+                "Subbab Pendukung": "2 (Metodologi), 8 (Aktor Strategis), 10 (Robustness)",
+            },
+            {
+                "Bidang/Scope": "Ilmu Sosial / Kebijakan Publik",
+                "Kontribusi yang Ditonjolkan": "Kuantifikasi segregasi kesejahteraan (assortativity + dekomposisi Montes), audit "
+                "exclusion/inclusion error bansos, segregasi spasial per dusun (Duncan D), dan identifikasi agen difusi "
+                "program berbasis posisi jaringan.",
+                "Subbab Pendukung": "4-7 (Homofili, Montes, Bansos, Digital), 9 (Spasial)",
+            },
+            {
+                "Bidang/Scope": "Interdisipliner (Computational Social Science)",
+                "Kontribusi yang Ditonjolkan": "Menjembatani data administratif Data Desa Presisi dengan indikator relasional "
+                "kebijakan: dari data mikro rumah tangga menjadi bukti struktural (jaringan, komunitas, spasial) yang "
+                "dapat ditindaklanjuti pemerintah desa — kerangka yang dapat direplikasi lintas desa.",
+                "Subbab Pendukung": "1 (Novelty), 3 (Struktur), 11 (Implikasi)",
+            },
+        ]
+        st.dataframe(pd.DataFrame(scope_rows), use_container_width=True, hide_index=True)
+
+        st.markdown(
+            "<b>Checklist kesiapan naskah Q1.</b>"
+            "<ul>"
+            "<li><b>Novelty eksplisit</b>: dekomposisi within-between + audit targeting berbasis jaringan pada data "
+            "sensus desa presisi (bukan sampel survei).</li>"
+            "<li><b>Rigor &amp; robustness</b>: threshold otomatis dengan uji sensitivitas (subbab 10) dan justifikasi "
+            "metodologis ambang kuartil peran aktor (subbab 8).</li>"
+            "<li><b>Reprodusibilitas</b>: parameter lengkap dilaporkan (basis fitur, metrik kemiripan, threshold, "
+            "seed Louvain); pipeline dapat dijalankan ulang pada data yang sama.</li>"
+            "<li><b>Etika data</b>: anonimisasi node/dusun, hasil agregat, pernyataan batasan interpretasi di setiap "
+            "temuan.</li>"
+            "<li><b>Keterbatasan</b>: jaringan kemiripan atribut (bukan relasi sosial teramati), satu desa studi kasus, "
+            "perlu verifikasi lapangan — dinyatakan eksplisit agar kredibel di mata reviewer.</li>"
+            "<li><b>Data availability statement</b>: sebutkan skema akses data (data mikro tidak dibagikan terbuka; "
+            "agregat/kode analisis dapat dibagikan atas permintaan).</li>"
+            "</ul>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            "<b>Referensi metodologis kunci.</b><br>"
+            "Blondel, V.D., dkk. (2008). Fast unfolding of communities in large networks. <i>J. Stat. Mech.</i> — deteksi komunitas Louvain.<br>"
+            "Newman, M.E.J. (2003). Mixing patterns in networks. <i>Physical Review E</i> — assortativity.<br>"
+            "Montes, F., dkk. (2018). Benchmarking seeding strategies... (dekomposisi within-between assortativity).<br>"
+            "Freeman, L.C. (1979). Centrality in social networks: Conceptual clarification. <i>Social Networks</i>.<br>"
+            "Borgatti, S.P. (2006). Identifying sets of key players in a social network. <i>Comput. Math. Organ. Theory</i>.<br>"
+            "Valente, T.W. &amp; Pumpuang, P. (2007). Identifying opinion leaders to promote behavior change. <i>Health Educ. Behav.</i><br>"
+            "Valente, T.W. (2012). Network interventions. <i>Science</i>, 337(6090).<br>"
+            "Guimer&agrave;, R. &amp; Amaral, L.A.N. (2005). Functional cartography of complex metabolic networks. <i>Nature</i>, 433 — taksonomi peran node berbasis ambang statistik.<br>"
+            "Costenbader, E. &amp; Valente, T.W. (2003). The stability of centrality measures... <i>Social Networks</i>.<br>"
+            "Duncan, O.D. &amp; Duncan, B. (1955). A methodological analysis of segregation indexes. <i>Am. Sociol. Rev.</i> — indeks disimilaritas.<br>"
+            "Tukey, J.W. (1977). <i>Exploratory Data Analysis</i> — konvensi kuartil.",
+            unsafe_allow_html=True,
+        )
         st.caption(
             "Catatan etika: seluruh hasil bersifat agregat dan anonim; temuan adalah indikasi awal berbasis data "
             "sekunder dan memerlukan verifikasi lapangan sebelum digunakan untuk keputusan penetapan sasaran."

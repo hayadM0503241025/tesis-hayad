@@ -6493,11 +6493,10 @@ def build_journal_icon_map(df_spatial, category_col, icon_map, color_map, catego
             go.Scattermapbox(
                 lat=sub["lat"],
                 lon=sub["lon"],
-                mode="markers+text",
-                marker=dict(size=20, color=color, opacity=0.55),
+                mode="text",
                 text=[icon] * len(sub),
                 textposition="middle center",
-                textfont=dict(size=15),
+                textfont=dict(size=13, color=color),
                 hovertext=[f"{icon} {category}<br>{h}" for h in sub["Hover Aman"]],
                 hoverinfo="text",
                 name=f"{icon} {category}",

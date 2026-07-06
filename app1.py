@@ -7330,7 +7330,7 @@ def render_journal_q1_page(
         )
         fig_m.update_traces(texttemplate="%{text:.3f}")
         style_publication_figure(
-            fig_m, title="Dekomposisi Assortativity Within-Between (Montes)", height=360,
+            fig_m, title="Dekomposisi Assortativity Within-Between", height=360,
             xaxis_title="", yaxis_title="Q*", showlegend=False,
         )
         st.plotly_chart(fig_m, use_container_width=True, config=PLOTLY_DRAW_CONFIG)

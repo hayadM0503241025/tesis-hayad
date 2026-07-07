@@ -10261,26 +10261,42 @@ def _slr_finalize(fig, height=None, legend_bottom=False):
     return fig
 
 
-def _slr_annual_growth(years):
-    """CAGR produksi tahunan dari tahun awal hingga tahun puncak produksi.
+def _slr_auto_incomplete_years(years, cap=3):
+    """Deteksi otomatis ekor tahun yang belum lengkap terindeks (deret menurun di akhir)."""
+    ys = [y for y in years if y]
+    if len(ys) < 3:
+        return 0
+    ser = pd.Series(ys).value_counts().sort_index()
+    vals = list(ser.values)
+    cnt = 0
+    for i in range(len(vals) - 1, 0, -1):
+        if vals[i] < vals[i - 1]:
+            cnt += 1
+        else:
+            break
+    return min(cnt, cap)
 
-    Memakai tahun puncak (bukan tahun terakhir) agar tidak bias oleh tahun terkini
-    yang belum lengkap terindeks (indexing lag). Mengembalikan (cagr_persen, ypeak).
+
+def _slr_annual_growth(years, exclude_last=0):
+    """CAGR produksi tahunan (rumus baku bibliometrix) setelah mengecualikan
+    `exclude_last` tahun terakhir yang belum lengkap terindeks.
+    Mengembalikan (cagr_persen, tahun_awal, tahun_akhir_efektif).
     """
     ys = [y for y in years if y]
     if len(ys) < 2:
-        return None, None
+        return None, None, None
     ser = pd.Series(ys).value_counts().sort_index()
-    yfirst = int(ser.index.min())
-    ypeak = int(ser.idxmax())
-    if ypeak <= yfirst:
-        ypeak = int(ser.index.max())
-    if ypeak <= yfirst:
-        return None, None
-    n0, n1 = float(ser.loc[yfirst]), float(ser.loc[ypeak])
+    idx = list(ser.index)
+    if exclude_last > 0 and len(idx) > exclude_last + 1:
+        idx = idx[:-exclude_last]
+        ser = ser.loc[idx]
+    yfirst, ylast = int(ser.index.min()), int(ser.index.max())
+    if ylast <= yfirst:
+        return None, None, None
+    n0, n1 = float(ser.loc[yfirst]), float(ser.loc[ylast])
     if n0 <= 0 or n1 <= 0:
-        return None, None
-    return ((n1 / n0) ** (1.0 / (ypeak - yfirst)) - 1.0) * 100.0, ypeak
+        return None, None, None
+    return ((n1 / n0) ** (1.0 / (ylast - yfirst)) - 1.0) * 100.0, yfirst, ylast
 
 
 def _slr_doc_text(r):
@@ -10394,13 +10410,13 @@ def _slr_bridge_actors(G, part, top=10):
     return pd.DataFrame(rows).sort_values("Betweenness", ascending=False).head(top).reset_index(drop=True)
 
 
-def _slr_build_report(analysis, counts, per_db, taxonomy, challenges, apply_filter, min_au, max_nodes):
+def _slr_build_report(analysis, counts, per_db, taxonomy, challenges, apply_filter, min_au, max_nodes, exclude_recent=0):
     """Rakit draf 'Hasil dan Pembahasan' (RQ1–RQ4 + Kesimpulan) dari angka nyata."""
     n = len(analysis)
     years = [r["Year"] for r in analysis if r["Year"]]
     ymin, ymax = (min(years), max(years)) if years else (None, None)
     n_years = (ymax - ymin + 1) if years else 0
-    cagr, ypeak = _slr_annual_growth(years)
+    cagr, cg_first, cg_last = _slr_annual_growth(years, exclude_recent)
     cites = [r["Cites"] or 0 for r in analysis]
     total_cites, avg_cites = int(np.sum(cites)), (np.mean(cites) if cites else 0)
     src_cnt, _ = _slr_counter(analysis, "SourceTitle")
@@ -10454,7 +10470,7 @@ def _slr_build_report(analysis, counts, per_db, taxonomy, challenges, apply_filt
     L.append("### 3.1. Analisis Performa (RQ1)\n")
     L.append(
         f"Korpus final terdiri atas **{n} dokumen** yang terbit pada rentang "
-        f"**{ymin}–{ymax}**" + (f" dengan laju pertumbuhan tahunan (CAGR produksi hingga puncak {ypeak}) sekitar **{cagr:.1f}%**" if cagr else "") +
+        f"**{ymin}–{ymax}**" + (f" dengan laju pertumbuhan tahunan (CAGR produksi {cg_first}–{cg_last}, {exclude_recent} tahun terakhir dikecualikan karena belum lengkap terindeks) sekitar **{cagr:.1f}%**" if cagr else "") +
         f", tersebar pada **{n_src} sumber** (jurnal/konferensi) dan mengumpulkan "
         f"**{total_cites} sitasi** (rata-rata **{avg_cites:.1f} sitasi/dokumen**). "
         f"Sumber paling produktif adalah {_srclist(top_src)}. "
@@ -10560,6 +10576,12 @@ def render_slr_analysis_page():
                                 help="Dokumen lolos skrining bila judul/abstrak/kata kunci memuat salah satu istilah. Kosongkan untuk meloloskan semua.")
         req_abstract = st.checkbox("Wajib punya abstrak (Eligibility)", value=True)
         apply_filter = st.checkbox("Terapkan filter PRISMA ke analisis bibliometrik", value=True)
+        _auto_excl = _slr_auto_incomplete_years([r["Year"] for r in unique if r["Year"]])
+        exclude_recent = st.slider(
+            "Kecualikan N tahun terakhir (belum lengkap)", 0, 4, _auto_excl,
+            help="Tahun terkini sering belum lengkap terindeks (indexing lag). "
+                 "Tahun-tahun ini dikeluarkan sebelum menghitung laju pertumbuhan (CAGR). "
+                 f"Default terdeteksi otomatis = {_auto_excl}. Lihat grafik produksi tahunan untuk menyesuaikan.")
         st.markdown("### 🕸️ Parameter Peta Sains")
         min_kw = st.slider("Min. kemunculan kata kunci", 2, 12, 3)
         min_au = st.slider("Min. dokumen per penulis", 1, 8, 2)
@@ -10713,11 +10735,12 @@ def render_slr_analysis_page():
         src_top = src_cnt.most_common(1)[0] if src_cnt else ("-", 0)
         au_top = au_cnt.most_common(1)[0] if au_cnt else (None, 0)
         top_doc = top_cited[0] if top_cited else None
-        cagr, ypeak = _slr_annual_growth(years_a)
+        cagr, cg_first, cg_last = _slr_annual_growth(years_a, exclude_recent)
+        cagr_label = (f"{cagr:.1f}% ({cg_first}–{cg_last})" if cagr is not None else "-")
         rq1_tbl = pd.DataFrame([
             ("Periode publikasi", f"{min(years_a)}–{max(years_a)}" if years_a else "-"),
             ("Jumlah studi dianalisis", f"{len(analysis)}"),
-            ("Laju pertumbuhan tahunan (CAGR s.d. puncak)", f"{cagr:.1f}% (hingga {ypeak})" if cagr is not None else "-"),
+            (f"Laju pertumbuhan tahunan (CAGR, {exclude_recent} tahun terakhir dikecualikan)", cagr_label),
             ("Jumlah sumber unik", f"{len({r['SourceTitle'] for r in analysis if r['SourceTitle']})}"),
             ("Sumber paling produktif", f"{src_top[0]} ({src_top[1]} dok.)"),
             ("Penulis paling produktif", f"{au_disp.get(au_top[0], '-')} ({au_top[1]} dok.)" if au_top[0] else "-"),
@@ -10955,7 +10978,7 @@ def render_slr_analysis_page():
         st.caption("Teks berikut dirakit otomatis dari angka hasil analisis (basis: studi terpilih setelah PRISMA). "
                    "Salin ke naskah lalu sunting seperlunya. Angka diperbarui mengikuti data & filter yang aktif.")
         report_md = _slr_build_report(analysis, counts, per_db, SLR_TAXONOMY, SLR_CHALLENGES,
-                                      apply_filter, min_au, max_nodes)
+                                      apply_filter, min_au, max_nodes, exclude_recent)
         st.markdown(report_md)
         st.download_button("⬇️ Unduh bagian Hasil & Pembahasan (.md)",
                            report_md.encode("utf-8"), "hasil_dan_pembahasan.md", "text/markdown",

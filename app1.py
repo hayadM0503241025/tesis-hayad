@@ -9771,6 +9771,32 @@ def slr_load_raw(data_dir=SLR_DATA_DIR):
     return records, dict(per_db)
 
 
+def slr_load_uploaded(files):
+    """Baca berkas CSV yang diunggah pengguna (data baru) dengan skema yang sama."""
+    records, per_db = [], _Counter()
+    for f in files:
+        df = None
+        for enc in ("utf-8-sig", "latin-1"):
+            try:
+                f.seek(0)
+                df = pd.read_csv(f, encoding=enc, dtype=str, on_bad_lines="skip")
+                break
+            except Exception:
+                continue
+        if df is None:
+            continue
+        cols = list(df.columns)
+        db = _slr_detect_source(cols)
+        for _, row in df.iterrows():
+            rec = _slr_map_row(row, cols, db)
+            if not rec["Title"]:
+                continue
+            rec["_file"] = getattr(f, "name", "unggahan")
+            records.append(rec)
+            per_db[db] += 1
+    return records, dict(per_db)
+
+
 def slr_dedupe(records):
     seen_doi, seen_title, unique, dup = {}, {}, [], 0
     for rec in records:
@@ -9941,15 +9967,28 @@ def _slr_node_table(G, part):
     return pd.DataFrame(rows).sort_values(["Klaster", "Kemunculan"], ascending=[True, False]).reset_index(drop=True)
 
 
+def _slr_hex_rgba(hexc, alpha):
+    h = hexc.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _slr_edge_color(a, b, part):
+    """Edge diwarnai sesuai klaster bila kedua ujung sekelaster; abu-abu bila antarklaster."""
+    if part.get(a) == part.get(b):
+        return _slr_hex_rgba(SLR_CLUSTER_COLORS[part.get(a, 0) % len(SLR_CLUSTER_COLORS)], 0.55)
+    return "rgba(148,163,184,0.30)"
+
+
 def _slr_network_figure(G, title, mode="cluster", part=None, height=720):
-    """Visualisasi jaringan gaya VOSviewer: Network / Overlay / Density."""
+    """Visualisasi jaringan gaya VOSviewer: Network / Overlay / Density / 3D."""
     if G.number_of_nodes() == 0:
         return None, {}
     part = part if part is not None else _slr_communities(G)
     nodes = list(G.nodes())
     n = len(nodes)
     k_val = 2.4 / np.sqrt(max(n, 1))
-    pos = nx.spring_layout(G, weight="weight", seed=42, k=k_val, iterations=250)
+    wmax = max((d["weight"] for _, _, d in G.edges(data=True)), default=1)
 
     occs = np.array([G.nodes[x]["occ"] for x in nodes], dtype=float)
     mn, mx = occs.min(), occs.max()
@@ -9967,6 +10006,51 @@ def _slr_network_figure(G, title, mode="cluster", part=None, height=720):
     else:
         show_lbl = norm >= np.quantile(norm, 0.45)
 
+    # ---- 3D mode (interaktif, bisa diputar) ----
+    if mode == "3d":
+        # label lebih selektif agar tidak menumpuk di ruang 3D
+        show_lbl3d = norm >= np.quantile(norm, 0.5) if n > 16 else np.ones(n, dtype=bool)
+        pos3 = nx.spring_layout(G, weight="weight", seed=42, dim=3, k=k_val, iterations=200)
+        fig = go.Figure()
+        egroups = {}
+        for a, b, d in G.edges(data=True):
+            col = _slr_edge_color(a, b, part)
+            lvl = min(4, int(5 * d["weight"] / wmax)) if wmax > 0 else 0
+            xs, ys, zs = egroups.setdefault((col, lvl), ([], [], []))
+            xs += [pos3[a][0], pos3[b][0], None]
+            ys += [pos3[a][1], pos3[b][1], None]
+            zs += [pos3[a][2], pos3[b][2], None]
+        for (col, lvl), (xs, ys, zs) in egroups.items():
+            fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode="lines",
+                                       line=dict(width=1.5 + lvl * 1.6, color=col),
+                                       hoverinfo="none", showlegend=False))
+        n_clusters = max(part.values()) + 1 if part else 1
+        for c in range(n_clusters):
+            idx = [i for i, x in enumerate(nodes) if part.get(x, 0) == c]
+            if not idx:
+                continue
+            fig.add_trace(go.Scatter3d(
+                x=[pos3[nodes[i]][0] for i in idx], y=[pos3[nodes[i]][1] for i in idx],
+                z=[pos3[nodes[i]][2] for i in idx], mode="markers+text",
+                marker=dict(size=[6 + sizes[i] * 0.35 for i in idx],
+                            color=SLR_CLUSTER_COLORS[c % len(SLR_CLUSTER_COLORS)],
+                            line=dict(width=1, color="#0f172a"), opacity=0.95),
+                text=[labels[i] if show_lbl3d[i] else "" for i in idx],
+                textposition="top center", textfont=dict(size=11, color="#0b1220"),
+                hovertext=[hover[i] for i in idx], hoverinfo="text",
+                name=f"Klaster {c + 1}", showlegend=True))
+        axis = dict(showbackground=True, backgroundcolor="#F8FAFC", gridcolor="#E2E8F0",
+                    showticklabels=False, title="", zerolinecolor="#CBD5E1")
+        fig.update_layout(
+            title=dict(text=title, x=0.02, xanchor="left", font=dict(size=20, color="#111827")),
+            height=height, paper_bgcolor="#FFFFFF", font=dict(size=14, color=PLOT_TEXT_COLOR),
+            margin=dict(l=0, r=0, t=64, b=0),
+            scene=dict(xaxis=axis, yaxis=axis, zaxis=axis,
+                       camera=dict(eye=dict(x=1.5, y=1.5, z=1.1))),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, bgcolor="rgba(255,255,255,0.9)"))
+        return fig, part
+
+    pos = nx.spring_layout(G, weight="weight", seed=42, k=k_val, iterations=250)
     fig = go.Figure()
 
     # ---- Density mode (peta kepadatan) ----
@@ -9991,18 +10075,17 @@ def _slr_network_figure(G, title, mode="cluster", part=None, height=720):
         fig.update_layout(font=dict(size=15), title_font_size=20)
         return fig, part
 
-    # ---- Edges dengan tebal variabel sesuai kekuatan tautan ----
-    wmax = max((d["weight"] for _, _, d in G.edges(data=True)), default=1)
-    buckets = {}
+    # ---- Edges: warna sesuai klaster (Network) atau abu-abu (Overlay), tebal sesuai kekuatan tautan ----
+    egroups = {}
     for a, b, d in G.edges(data=True):
         lvl = min(4, int(5 * d["weight"] / wmax)) if wmax > 0 else 0
-        xs, ys = buckets.setdefault(lvl, ([], []))
+        col = _slr_edge_color(a, b, part) if mode == "cluster" else "rgba(120,132,150,0.32)"
+        xs, ys = egroups.setdefault((col, lvl), ([], []))
         xs += [pos[a][0], pos[b][0], None]
         ys += [pos[a][1], pos[b][1], None]
-    for lvl in sorted(buckets):
-        xs, ys = buckets[lvl]
+    for (col, lvl), (xs, ys) in egroups.items():
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
-                                 line=dict(width=0.5 + lvl * 0.95, color="rgba(120,132,150,0.35)"),
+                                 line=dict(width=0.5 + lvl * 0.95, color=col),
                                  hoverinfo="none", showlegend=False))
 
     if mode == "overlay":
@@ -10119,8 +10202,22 @@ def render_slr_analysis_page():
     )
 
     records, per_db = slr_load_raw()
+    with st.sidebar:
+        st.markdown("### 📥 Data Baru (opsional)")
+        up_files = st.file_uploader(
+            "Tambah berkas ekspor SLR (CSV)", type=["csv"], accept_multiple_files=True,
+            key="slr_new_data",
+            help="Unggah CSV ekspor baru (Scopus/IEEE/WoS/Google Scholar). "
+                 "Data akan digabung otomatis dengan folder slr/ lalu dideduplikasi.")
+    if up_files:
+        rec_up, per_up = slr_load_uploaded(up_files)
+        records = list(records) + rec_up
+        per_db = dict(per_db)
+        for k, v in per_up.items():
+            per_db[k] = per_db.get(k, 0) + v
+        st.success(f"✅ {len(rec_up)} rekaman baru ditambahkan dari {len(up_files)} berkas unggahan.")
     if not records:
-        st.error("Tidak ada berkas CSV yang terbaca di folder `slr/`. Pastikan file ekspor tersedia.")
+        st.error("Tidak ada berkas CSV yang terbaca di folder `slr/` maupun unggahan. Pastikan file ekspor tersedia.")
         return
     unique, dup = slr_dedupe(records)
 
@@ -10140,15 +10237,16 @@ def render_slr_analysis_page():
         min_au = st.slider("Min. dokumen per penulis", 1, 8, 2)
         viz_mode = st.radio(
             "Mode Visualisasi Jaringan",
-            ["Network (klaster)", "Overlay (tahun)", "Density (kepadatan)"],
+            ["Network (klaster)", "Overlay (tahun)", "Density (kepadatan)", "3D (interaktif)"],
             index=0,
-            help="Network: klaster berwarna (metode greedy modularity). "
-                 "Overlay: warna per tahun untuk melihat tren. Density: peta kepadatan gaya VOSviewer.",
+            help="Network: klaster + edge berwarna (greedy modularity). "
+                 "Overlay: warna per tahun. Density: peta kepadatan gaya VOSviewer. "
+                 "3D: jaringan tiga dimensi yang bisa diputar.",
         )
         max_nodes = st.slider("Maks. node jaringan", 20, 150, 80, 5)
         net_height = st.slider("Tinggi kanvas jaringan (px)", 560, 1000, 760, 20)
     color_mode = {"Network (klaster)": "cluster", "Overlay (tahun)": "overlay",
-                  "Density (kepadatan)": "density"}[viz_mode]
+                  "Density (kepadatan)": "density", "3D (interaktif)": "3d"}[viz_mode]
 
     inc_terms = [t.strip().lower() for t in inc_raw.split(",") if t.strip()]
 
@@ -10308,8 +10406,9 @@ def render_slr_analysis_page():
     with tab_concept:
         st.markdown(f"#### Peta Co-occurrence Kata Kunci Penulis — mode: {viz_mode}")
         st.caption("Analog VOSviewer *Co-occurrence of author keywords*. Ukuran node = frekuensi; "
-                   "tebal garis = kekuatan tautan. Warna = klaster tema (Network, metode greedy modularity), "
-                   "rerata tahun (Overlay), atau kepadatan (Density).")
+                   "tebal garis = kekuatan tautan; **edge berwarna sesuai klaster**. "
+                   "Mode: Network (klaster, greedy modularity), Overlay (rerata tahun), "
+                   "Density (kepadatan), atau 3D interaktif yang bisa diputar.")
         Gk = _slr_build_cooccurrence(analysis, "Keywords", min_kw, 1, max_nodes)
         if Gk.number_of_nodes() == 0:
             st.info("Belum ada kata kunci yang memenuhi ambang. Turunkan 'Min. kemunculan kata kunci' di sidebar.")

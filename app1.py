@@ -9579,6 +9579,25 @@ from collections import Counter as _Counter, defaultdict as _defaultdict
 
 SLR_DATA_DIR = "slr"
 
+# Palet klaster gaya VOSviewer (kontras tinggi, ramah publikasi hitam-putih)
+SLR_CLUSTER_COLORS = [
+    "#E4572E", "#2E86AB", "#3BB273", "#F3A712", "#7B2CBF", "#00A6A6",
+    "#D7263D", "#4059AD", "#C05299", "#1B998B", "#B36A5E", "#5C80BC",
+    "#8AB17D", "#E09F3E", "#9B5DE5", "#0F4C5C",
+]
+# Skala kepadatan gaya VOSviewer (biru → hijau → kuning → merah)
+SLR_DENSITY_SCALE = [
+    [0.0, "#0b2f6b"], [0.25, "#1f7a8c"], [0.5, "#4caf50"],
+    [0.7, "#f4e04d"], [0.85, "#f59e0b"], [1.0, "#d7263d"],
+]
+# Konfigurasi unduhan gambar resolusi tinggi (siap tempel di jurnal/artikel)
+SLR_PLOT_CONFIG = {
+    "displaylogo": False,
+    "scrollZoom": True,
+    "toImageButtonOptions": {"format": "png", "scale": 3, "filename": "slr_visual"},
+    "modeBarButtonsToAdd": ["drawline", "drawrect", "drawcircle", "eraseshape"],
+}
+
 SLR_COUNTRY_LIST = [
     "United States", "United Kingdom", "China", "India", "Germany", "France", "Italy", "Spain",
     "Canada", "Australia", "Japan", "South Korea", "Korea", "Brazil", "Russia", "Netherlands",
@@ -9885,53 +9904,141 @@ def _slr_build_cooccurrence(records, field, min_occ, min_edge=1, max_nodes=80):
     return G
 
 
-def _slr_network_figure(G, title, color_mode="cluster", height=640):
+def _slr_communities(G):
+    """Deteksi komunitas metode standar (Clauset-Newman-Moore greedy modularity)."""
     if G.number_of_nodes() == 0:
-        return None
+        return {}
+    if G.number_of_edges() == 0:
+        return {n: 0 for n in G.nodes()}
     try:
-        partition = community_louvain.best_partition(G, weight="weight", random_state=42) if G.number_of_edges() else {n: 0 for n in G.nodes()}
+        comms = nx.community.greedy_modularity_communities(G, weight="weight")
     except Exception:
-        partition = {n: 0 for n in G.nodes()}
-    k_val = 1.8 / np.sqrt(max(G.number_of_nodes(), 1))
-    pos = nx.spring_layout(G, weight="weight", seed=42, k=k_val, iterations=120)
+        comms = list(nx.connected_components(G))
+    part = {}
+    for i, com in enumerate(sorted(comms, key=len, reverse=True)):
+        for n in com:
+            part[n] = i
+    for n in G.nodes():
+        part.setdefault(n, 0)
+    return part
 
-    edge_x, edge_y = [], []
-    maxw = max((d["weight"] for _, _, d in G.edges(data=True)), default=1)
-    for a, b, d in G.edges(data=True):
-        edge_x += [pos[a][0], pos[b][0], None]
-        edge_y += [pos[a][1], pos[b][1], None]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines",
-                             line=dict(width=0.6, color="rgba(100,116,139,0.35)"),
-                             hoverinfo="none", showlegend=False))
 
-    occs = np.array([G.nodes[n]["occ"] for n in G.nodes()], dtype=float)
-    smin, smax = occs.min(), occs.max()
-    sizes = 16 + 40 * (occs - smin) / (smax - smin) if smax > smin else np.full_like(occs, 24)
+def _slr_node_table(G, part):
+    """Tabel metrik tiap item jaringan (gaya tabel ekspor VOSviewer)."""
+    rows = []
+    for n in G.nodes():
+        tls = int(sum(d["weight"] for _, _, d in G.edges(n, data=True)))
+        rows.append({
+            "Item": G.nodes[n]["label"],
+            "Klaster": part.get(n, 0) + 1,
+            "Kemunculan": G.nodes[n]["occ"],
+            "Total Link Strength": tls,
+            "Rerata Tahun": round(G.nodes[n]["avg_year"], 1) if G.nodes[n]["avg_year"] else None,
+            "Total Sitasi": G.nodes[n]["cites"],
+        })
+    if not rows:
+        return pd.DataFrame(columns=["Item", "Klaster", "Kemunculan", "Total Link Strength", "Rerata Tahun", "Total Sitasi"])
+    return pd.DataFrame(rows).sort_values(["Klaster", "Kemunculan"], ascending=[True, False]).reset_index(drop=True)
 
-    if color_mode == "overlay":
-        yrs = np.array([G.nodes[n]["avg_year"] if G.nodes[n]["avg_year"] else np.nan for n in G.nodes()])
-        node_color = yrs
-        marker = dict(size=sizes, color=node_color, colorscale="Turbo", showscale=True,
-                      colorbar=dict(title="Rerata Tahun"), line=dict(width=1.2, color="#111827"))
+
+def _slr_network_figure(G, title, mode="cluster", part=None, height=720):
+    """Visualisasi jaringan gaya VOSviewer: Network / Overlay / Density."""
+    if G.number_of_nodes() == 0:
+        return None, {}
+    part = part if part is not None else _slr_communities(G)
+    nodes = list(G.nodes())
+    n = len(nodes)
+    k_val = 2.4 / np.sqrt(max(n, 1))
+    pos = nx.spring_layout(G, weight="weight", seed=42, k=k_val, iterations=250)
+
+    occs = np.array([G.nodes[x]["occ"] for x in nodes], dtype=float)
+    mn, mx = occs.min(), occs.max()
+    norm = (occs - mn) / (mx - mn) if mx > mn else np.zeros_like(occs)
+    sizes = 18 + 46 * np.sqrt(norm)
+
+    hover = [f"<b>{G.nodes[x]['label']}</b><br>Kemunculan: {G.nodes[x]['occ']}"
+             f"<br>Total link strength: {int(sum(d['weight'] for _, _, d in G.edges(x, data=True)))}"
+             f"<br>Klaster: {part.get(x, 0) + 1}"
+             + (f"<br>Rerata tahun: {G.nodes[x]['avg_year']:.1f}" if G.nodes[x]['avg_year'] else "")
+             + f"<br>Total sitasi: {G.nodes[x]['cites']}" for x in nodes]
+    labels = [G.nodes[x]["label"] for x in nodes]
+    if n <= 40:
+        show_lbl = np.ones(n, dtype=bool)
     else:
-        node_color = [CONTRAST_COLORS[partition[n] % len(CONTRAST_COLORS)] for n in G.nodes()]
-        marker = dict(size=sizes, color=node_color, line=dict(width=1.2, color="#111827"))
+        show_lbl = norm >= np.quantile(norm, 0.45)
 
-    labels = [G.nodes[n]["label"] for n in G.nodes()]
-    hover = [f"<b>{G.nodes[n]['label']}</b><br>Kemunculan: {G.nodes[n]['occ']}"
-             f"<br>Klaster: {partition[n] + 1}"
-             + (f"<br>Rerata tahun: {G.nodes[n]['avg_year']:.1f}" if G.nodes[n]['avg_year'] else "")
-             + f"<br>Total sitasi: {G.nodes[n]['cites']}" for n in G.nodes()]
-    show_lbl = occs >= np.percentile(occs, 55) if len(occs) > 18 else np.ones_like(occs, dtype=bool)
-    fig.add_trace(go.Scatter(
-        x=[pos[n][0] for n in G.nodes()], y=[pos[n][1] for n in G.nodes()],
-        mode="markers+text", marker=marker,
-        text=[lbl if show else "" for lbl, show in zip(labels, show_lbl)],
-        textposition="top center", textfont=dict(size=10, color="#0F172A"),
-        hovertext=hover, hoverinfo="text", showlegend=False))
-    style_network_figure(fig, title=title, height=height)
-    return fig, partition
+    fig = go.Figure()
+
+    # ---- Density mode (peta kepadatan) ----
+    if mode == "density":
+        xs_rep, ys_rep = [], []
+        for i, x in enumerate(nodes):
+            reps = int(max(1, round(occs[i])))
+            xs_rep += [pos[x][0]] * reps
+            ys_rep += [pos[x][1]] * reps
+        fig.add_trace(go.Histogram2dContour(
+            x=xs_rep, y=ys_rep, colorscale=SLR_DENSITY_SCALE, reversescale=False,
+            showscale=True, ncontours=22, contours=dict(coloring="fill"),
+            line=dict(width=0), colorbar=dict(title="Kepadatan", thickness=16),
+            hoverinfo="skip"))
+        fig.add_trace(go.Scatter(
+            x=[pos[x][0] for x in nodes], y=[pos[x][1] for x in nodes],
+            mode="markers+text", marker=dict(size=6, color="rgba(15,23,42,0.85)"),
+            text=[lbl if s else "" for lbl, s in zip(labels, show_lbl)],
+            textposition="top center", textfont=dict(size=12, color="#0b1220"),
+            hovertext=hover, hoverinfo="text", showlegend=False))
+        style_network_figure(fig, title=title, height=height)
+        fig.update_layout(font=dict(size=15), title_font_size=20)
+        return fig, part
+
+    # ---- Edges dengan tebal variabel sesuai kekuatan tautan ----
+    wmax = max((d["weight"] for _, _, d in G.edges(data=True)), default=1)
+    buckets = {}
+    for a, b, d in G.edges(data=True):
+        lvl = min(4, int(5 * d["weight"] / wmax)) if wmax > 0 else 0
+        xs, ys = buckets.setdefault(lvl, ([], []))
+        xs += [pos[a][0], pos[b][0], None]
+        ys += [pos[a][1], pos[b][1], None]
+    for lvl in sorted(buckets):
+        xs, ys = buckets[lvl]
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
+                                 line=dict(width=0.5 + lvl * 0.95, color="rgba(120,132,150,0.35)"),
+                                 hoverinfo="none", showlegend=False))
+
+    if mode == "overlay":
+        yrs = np.array([G.nodes[x]["avg_year"] if G.nodes[x]["avg_year"] else np.nan for x in nodes])
+        fig.add_trace(go.Scatter(
+            x=[pos[x][0] for x in nodes], y=[pos[x][1] for x in nodes],
+            mode="markers+text",
+            marker=dict(size=sizes, color=yrs, colorscale="Turbo", showscale=True,
+                        colorbar=dict(title="Rerata<br>Tahun", thickness=16),
+                        line=dict(width=1.4, color="#0f172a")),
+            text=[lbl if s else "" for lbl, s in zip(labels, show_lbl)],
+            textposition="top center", textfont=dict(size=12, color="#0b1220"),
+            hovertext=hover, hoverinfo="text", showlegend=False))
+    else:  # cluster mode — satu trace per klaster agar ada legenda
+        n_clusters = max(part.values()) + 1 if part else 1
+        for c in range(n_clusters):
+            idx = [i for i, x in enumerate(nodes) if part.get(x, 0) == c]
+            if not idx:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[pos[nodes[i]][0] for i in idx], y=[pos[nodes[i]][1] for i in idx],
+                mode="markers+text",
+                marker=dict(size=[sizes[i] for i in idx],
+                            color=SLR_CLUSTER_COLORS[c % len(SLR_CLUSTER_COLORS)],
+                            line=dict(width=1.4, color="#0f172a")),
+                text=[labels[i] if show_lbl[i] else "" for i in idx],
+                textposition="top center", textfont=dict(size=12, color="#0b1220"),
+                hovertext=[hover[i] for i in idx], hoverinfo="text",
+                name=f"Klaster {c + 1}", showlegend=True))
+
+    style_network_figure(fig, title=title, height=height, showlegend=(mode == "cluster"))
+    fig.update_layout(
+        font=dict(size=15), title_font_size=20,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0, bgcolor="rgba(255,255,255,0.9)"),
+    )
+    return fig, part
 
 
 def _slr_counter(records, field):
@@ -9986,6 +10093,23 @@ def _slr_main_info(records):
     return pd.DataFrame(rows, columns=["Metrik", "Nilai"])
 
 
+def _slr_finalize(fig, height=None, legend_bottom=False):
+    """Perbesar font & rapikan margin agar grafik terbaca saat ditempel di jurnal."""
+    upd = dict(font=dict(size=15, color=PLOT_TEXT_COLOR), title_font_size=19,
+               margin=dict(l=70, r=30, t=72, b=60))
+    if height:
+        upd["height"] = height
+    if legend_bottom:
+        upd["legend"] = dict(orientation="h", yanchor="bottom", y=-0.28, x=0)
+    fig.update_layout(**upd)
+    try:
+        fig.update_xaxes(title_font_size=15, tickfont_size=13)
+        fig.update_yaxes(title_font_size=15, tickfont_size=13)
+    except Exception:
+        pass
+    return fig
+
+
 def render_slr_analysis_page():
     st.markdown("<h1 class='main-header'>Analisis SLR — PRISMA 2020 & Bibliometrik</h1>", unsafe_allow_html=True)
     st.caption(
@@ -10014,9 +10138,17 @@ def render_slr_analysis_page():
         st.markdown("### 🕸️ Parameter Peta Sains")
         min_kw = st.slider("Min. kemunculan kata kunci", 2, 12, 3)
         min_au = st.slider("Min. dokumen per penulis", 1, 8, 2)
-        viz_mode = st.radio("Mode Visualisasi Jaringan", ["Network (klaster)", "Overlay (tahun)"], index=0)
-        max_nodes = st.slider("Maks. node jaringan", 20, 120, 70, 5)
-    color_mode = "overlay" if viz_mode.startswith("Overlay") else "cluster"
+        viz_mode = st.radio(
+            "Mode Visualisasi Jaringan",
+            ["Network (klaster)", "Overlay (tahun)", "Density (kepadatan)"],
+            index=0,
+            help="Network: klaster berwarna (metode greedy modularity). "
+                 "Overlay: warna per tahun untuk melihat tren. Density: peta kepadatan gaya VOSviewer.",
+        )
+        max_nodes = st.slider("Maks. node jaringan", 20, 150, 80, 5)
+        net_height = st.slider("Tinggi kanvas jaringan (px)", 560, 1000, 760, 20)
+    color_mode = {"Network (klaster)": "cluster", "Overlay (tahun)": "overlay",
+                  "Density (kepadatan)": "density"}[viz_mode]
 
     inc_terms = [t.strip().lower() for t in inc_raw.split(",") if t.strip()]
 
@@ -10059,7 +10191,7 @@ def render_slr_analysis_page():
         k4.metric("Disertakan", counts["included"])
         c1, c2 = st.columns([3, 2])
         with c1:
-            st.plotly_chart(_slr_prisma_figure(counts), use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            st.plotly_chart(_slr_prisma_figure(counts), use_container_width=True, config=SLR_PLOT_CONFIG)
         with c2:
             st.markdown("**Rekap tiap fase**")
             phase_df = pd.DataFrame([
@@ -10095,31 +10227,37 @@ def render_slr_analysis_page():
             db_series = _Counter(r["DB"] for r in analysis)
             fig_db = px.pie(values=list(db_series.values()), names=list(db_series.keys()),
                             title="Komposisi Basis Data", hole=0.45,
-                            color_discrete_sequence=CONTRAST_COLORS)
-            style_publication_figure(fig_db, height=320)
-            st.plotly_chart(fig_db, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                            color_discrete_sequence=SLR_CLUSTER_COLORS)
+            style_publication_figure(fig_db, height=340)
+            _slr_finalize(fig_db)
+            st.plotly_chart(fig_db, use_container_width=True, config=SLR_PLOT_CONFIG)
         with cB:
             yr = _Counter(r["Year"] for r in analysis if r["Year"])
             if yr:
                 ydf = pd.DataFrame(sorted(yr.items()), columns=["Tahun", "Jumlah"])
                 ydf["Kumulatif"] = ydf["Jumlah"].cumsum()
                 fig_y = go.Figure()
-                fig_y.add_bar(x=ydf["Tahun"], y=ydf["Jumlah"], name="Produksi", marker_color="#2563EB")
+                fig_y.add_bar(x=ydf["Tahun"], y=ydf["Jumlah"], name="Produksi", marker_color="#2563EB",
+                              text=ydf["Jumlah"], textposition="outside")
                 fig_y.add_scatter(x=ydf["Tahun"], y=ydf["Kumulatif"], name="Kumulatif",
-                                  mode="lines+markers", line=dict(color="#B91C1C"), yaxis="y2")
+                                  mode="lines+markers", line=dict(color="#B91C1C", width=3), yaxis="y2")
                 fig_y.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False,
-                                                title="Kumulatif"))
-                style_publication_figure(fig_y, title="Produksi Ilmiah Tahunan", height=360,
+                                                title="Kumulatif"),
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+                style_publication_figure(fig_y, title="Produksi Ilmiah Tahunan", height=400,
                                          xaxis_title="Tahun", yaxis_title="Jumlah dokumen")
-                st.plotly_chart(fig_y, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                _slr_finalize(fig_y)
+                st.plotly_chart(fig_y, use_container_width=True, config=SLR_PLOT_CONFIG)
             src_cnt, _ = _slr_counter(analysis, "SourceTitle")
             top_src = pd.DataFrame(src_cnt.most_common(12), columns=["Sumber", "Jumlah"])
             if not top_src.empty:
                 fig_s = px.bar(top_src.sort_values("Jumlah"), x="Jumlah", y="Sumber",
                                orientation="h", color="Jumlah", color_continuous_scale="Blues",
-                               title="Sumber Paling Relevan")
-                style_publication_figure(fig_s, height=380)
-                st.plotly_chart(fig_s, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                               title="Sumber Paling Relevan", text="Jumlah")
+                fig_s.update_traces(textposition="outside")
+                style_publication_figure(fig_s, height=430)
+                _slr_finalize(fig_s)
+                st.plotly_chart(fig_s, use_container_width=True, config=SLR_PLOT_CONFIG)
         c1, c2 = st.columns(2)
         with c1:
             au_cnt, au_disp = _slr_counter(analysis, "Authors")
@@ -10128,29 +10266,57 @@ def render_slr_analysis_page():
             if not top_au.empty:
                 fig_a = px.bar(top_au.sort_values("Dokumen"), x="Dokumen", y="Penulis",
                                orientation="h", color="Dokumen", color_continuous_scale="Teal",
-                               title="Penulis Paling Produktif")
-                style_publication_figure(fig_a, height=430)
-                st.plotly_chart(fig_a, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                               title="Penulis Paling Produktif", text="Dokumen")
+                fig_a.update_traces(textposition="outside")
+                style_publication_figure(fig_a, height=470)
+                _slr_finalize(fig_a)
+                st.plotly_chart(fig_a, use_container_width=True, config=SLR_PLOT_CONFIG)
         with c2:
             st.markdown("**Dokumen Paling Banyak Disitasi (Global)**")
             top_cited = sorted(analysis, key=lambda r: r["Cites"] or 0, reverse=True)[:15]
             tc_df = pd.DataFrame([
                 {"Judul": (r["Title"][:70] + "…") if len(r["Title"]) > 70 else r["Title"],
                  "Tahun": r["Year"], "Sitasi": r["Cites"], "DB": r["DB"]} for r in top_cited])
-            st.dataframe(tc_df, use_container_width=True, hide_index=True, height=430)
+            st.dataframe(tc_df, use_container_width=True, hide_index=True, height=470)
+
+        # ----- Tabel Ringkasan RQ1 -----
+        st.markdown("#### 📄 Tabel Ringkasan RQ1")
+        years_a = [r["Year"] for r in analysis if r["Year"]]
+        cites_a = [r["Cites"] or 0 for r in analysis]
+        src_top = src_cnt.most_common(1)[0] if src_cnt else ("-", 0)
+        au_top = au_cnt.most_common(1)[0] if au_cnt else (None, 0)
+        top_doc = top_cited[0] if top_cited else None
+        n_years = (max(years_a) - min(years_a) + 1) if years_a else 0
+        cagr = ((len(analysis) ** (1 / n_years) - 1) * 100) if n_years > 1 and len(analysis) > 0 else 0
+        rq1_tbl = pd.DataFrame([
+            ("Periode publikasi", f"{min(years_a)}–{max(years_a)}" if years_a else "-"),
+            ("Jumlah studi dianalisis", f"{len(analysis)}"),
+            ("Laju pertumbuhan tahunan (proksi)", f"{cagr:.1f}%"),
+            ("Jumlah sumber unik", f"{len({r['SourceTitle'] for r in analysis if r['SourceTitle']})}"),
+            ("Sumber paling produktif", f"{src_top[0]} ({src_top[1]} dok.)"),
+            ("Penulis paling produktif", f"{au_disp.get(au_top[0], '-')} ({au_top[1]} dok.)" if au_top[0] else "-"),
+            ("Total sitasi terkumpul", f"{int(np.sum(cites_a))}"),
+            ("Rerata sitasi/dokumen", f"{np.mean(cites_a):.1f}" if cites_a else "-"),
+            ("Dokumen paling berpengaruh", f"{top_doc['Title'][:60]}… ({top_doc['Cites']} sitasi)" if top_doc else "-"),
+        ], columns=["Indikator (RQ1)", "Nilai"])
+        st.dataframe(rq1_tbl, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Unduh Ringkasan RQ1 (CSV)", rq1_tbl.to_csv(index=False).encode("utf-8"),
+                           "ringkasan_rq1.csv", "text/csv")
         st.caption("Menjawab RQ1: dinamika publikasi, sumber & penulis paling berpengaruh, dokumen paling berdampak.")
 
     # ---------------- CONCEPTUAL ----------------
     with tab_concept:
-        st.markdown("#### Peta Co-occurrence Kata Kunci Penulis")
+        st.markdown(f"#### Peta Co-occurrence Kata Kunci Penulis — mode: {viz_mode}")
         st.caption("Analog VOSviewer *Co-occurrence of author keywords*. Ukuran node = frekuensi; "
-                   "warna = klaster tema (mode Network) atau rerata tahun (mode Overlay).")
+                   "tebal garis = kekuatan tautan. Warna = klaster tema (Network, metode greedy modularity), "
+                   "rerata tahun (Overlay), atau kepadatan (Density).")
         Gk = _slr_build_cooccurrence(analysis, "Keywords", min_kw, 1, max_nodes)
         if Gk.number_of_nodes() == 0:
             st.info("Belum ada kata kunci yang memenuhi ambang. Turunkan 'Min. kemunculan kata kunci' di sidebar.")
         else:
-            fk, part_k = _slr_network_figure(Gk, f"Co-occurrence Kata Kunci (min={min_kw})", color_mode, height=660)
-            st.plotly_chart(fk, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            part_k = _slr_communities(Gk)
+            fk, _ = _slr_network_figure(Gk, f"Co-occurrence Kata Kunci (min={min_kw})", color_mode, part_k, height=net_height)
+            st.plotly_chart(fk, use_container_width=True, config=SLR_PLOT_CONFIG)
             colx, coly = st.columns([3, 2])
             with colx:
                 kw_cnt, _ = _slr_counter(analysis, "Keywords")
@@ -10158,20 +10324,15 @@ def render_slr_analysis_page():
                 fig_tm = px.treemap(top_kw, path=["Kata Kunci"], values="Frekuensi",
                                     color="Frekuensi", color_continuous_scale="Viridis",
                                     title="20 Kata Kunci Teratas")
-                fig_tm.update_layout(height=420, margin=dict(l=8, r=8, t=50, b=8))
-                st.plotly_chart(fig_tm, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                fig_tm.update_layout(height=440, margin=dict(l=8, r=8, t=52, b=8),
+                                     font=dict(size=14), title_font_size=18)
+                st.plotly_chart(fig_tm, use_container_width=True, config=SLR_PLOT_CONFIG)
             with coly:
-                st.markdown("**Klaster Tema (Louvain)**")
-                clusters = _defaultdict(list)
-                for n, c in part_k.items():
-                    clusters[c].append((Gk.nodes[n]["label"], Gk.nodes[n]["occ"]))
-                rows = []
-                for c in sorted(clusters):
-                    items = sorted(clusters[c], key=lambda x: x[1], reverse=True)
-                    rows.append({"Klaster": c + 1,
-                                 "Kata kunci inti": ", ".join(w for w, _ in items[:6]),
-                                 "n": len(items)})
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=420)
+                st.markdown("**Daftar Item Jaringan (gaya ekspor VOSviewer)**")
+                node_tbl = _slr_node_table(Gk, part_k)
+                st.dataframe(node_tbl, use_container_width=True, hide_index=True, height=440)
+                st.download_button("⬇️ Unduh item jaringan (CSV)", node_tbl.to_csv(index=False).encode("utf-8"),
+                                   "slr_keyword_nodes.csv", "text/csv")
             # keyword trend
             st.markdown("#### Tren Topik per Tahun (Overlay Temporal)")
             kw_cnt2, _ = _slr_counter(analysis, "Keywords")
@@ -10186,25 +10347,58 @@ def render_slr_analysis_page():
             if trend_rows:
                 tdf = pd.DataFrame(trend_rows).groupby(["Tahun", "Kata Kunci"]).size().reset_index(name="Jumlah")
                 fig_tr = px.line(tdf.sort_values("Tahun"), x="Tahun", y="Jumlah", color="Kata Kunci",
-                                 markers=True, color_discrete_sequence=CONTRAST_COLORS,
+                                 markers=True, color_discrete_sequence=SLR_CLUSTER_COLORS,
                                  title="Perkembangan 8 Kata Kunci Teratas")
-                style_publication_figure(fig_tr, height=380, xaxis_title="Tahun", yaxis_title="Kemunculan")
-                st.plotly_chart(fig_tr, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                fig_tr.update_traces(line=dict(width=3), marker=dict(size=8))
+                style_publication_figure(fig_tr, height=420, xaxis_title="Tahun", yaxis_title="Kemunculan")
+                _slr_finalize(fig_tr, legend_bottom=True)
+                st.plotly_chart(fig_tr, use_container_width=True, config=SLR_PLOT_CONFIG)
+
+            # ----- Tabel Ringkasan RQ2 (klaster tema) -----
+            st.markdown("#### 📄 Tabel Ringkasan RQ2 — Klaster Tema")
+            clusters = _defaultdict(list)
+            for nkey, c in part_k.items():
+                clusters[c].append(nkey)
+            rows = []
+            for c in sorted(clusters):
+                members = clusters[c]
+                items = sorted(members, key=lambda x: Gk.nodes[x]["occ"], reverse=True)
+                yrs = [Gk.nodes[x]["avg_year"] for x in members if Gk.nodes[x]["avg_year"]]
+                rows.append({
+                    "Klaster": c + 1,
+                    "Tema (kata kunci inti)": ", ".join(Gk.nodes[x]["label"] for x in items[:6]),
+                    "Jumlah item": len(members),
+                    "Total kemunculan": int(sum(Gk.nodes[x]["occ"] for x in members)),
+                    "Rerata tahun": round(float(np.mean(yrs)), 1) if yrs else None,
+                    "Total sitasi": int(sum(Gk.nodes[x]["cites"] for x in members)),
+                })
+            rq2_tbl = pd.DataFrame(rows)
+            st.dataframe(rq2_tbl, use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Unduh Ringkasan RQ2 (CSV)", rq2_tbl.to_csv(index=False).encode("utf-8"),
+                               "ringkasan_rq2.csv", "text/csv")
         st.caption("Menjawab RQ2: struktur tematik, klaster topik, dan pergeseran fokus riset antar waktu.")
 
     # ---------------- SOCIAL & INTELLECTUAL ----------------
     with tab_social:
-        st.markdown("#### Jaringan Ko-penulisan (Co-authorship)")
-        st.caption("Analog VOSviewer *Co-authorship (authors)*. Node = penulis; edge = publikasi bersama.")
+        st.markdown(f"#### Jaringan Ko-penulisan (Co-authorship) — mode: {viz_mode}")
+        st.caption("Analog VOSviewer *Co-authorship (authors)*. Node = penulis; tebal garis = jumlah publikasi bersama.")
         Ga = _slr_build_cooccurrence(analysis, "Authors", min_au, 1, max_nodes)
+        part_a = _slr_communities(Ga)
         if Ga.number_of_edges() == 0:
             st.info("Belum ada pasangan penulis yang berkolaborasi pada ambang ini. Turunkan 'Min. dokumen per penulis'.")
         else:
-            fa, _ = _slr_network_figure(Ga, f"Ko-penulisan (min dok={min_au})", color_mode, height=620)
-            st.plotly_chart(fa, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            fa, _ = _slr_network_figure(Ga, f"Ko-penulisan (min dok={min_au})", color_mode, part_a, height=net_height)
+            st.plotly_chart(fa, use_container_width=True, config=SLR_PLOT_CONFIG)
+            with st.expander("Daftar penulis & metrik jaringan (CSV siap unduh)"):
+                au_tbl = _slr_node_table(Ga, part_a)
+                st.dataframe(au_tbl, use_container_width=True, hide_index=True, height=340)
+                st.download_button("⬇️ Unduh item penulis (CSV)", au_tbl.to_csv(index=False).encode("utf-8"),
+                                   "slr_author_nodes.csv", "text/csv")
         st.divider()
         st.markdown("#### Kolaborasi Antarnegara (Peta Dunia)")
         cty_cnt, _ = _slr_counter(analysis, "Countries")
+        intl_pairs = 0
+        cdf = pd.DataFrame(columns=["Negara", "Dokumen"])
         if cty_cnt:
             cdf = pd.DataFrame(cty_cnt.most_common(), columns=["Negara", "Dokumen"])
             m1, m2 = st.columns([3, 2])
@@ -10212,22 +10406,50 @@ def render_slr_analysis_page():
                 fig_map = px.choropleth(cdf, locations="Negara", locationmode="country names",
                                         color="Dokumen", color_continuous_scale="YlOrRd",
                                         title="Produksi Ilmiah per Negara")
-                fig_map.update_layout(height=430, margin=dict(l=0, r=0, t=50, b=0),
-                                      geo=dict(bgcolor="#FFFFFF", showframe=False))
-                st.plotly_chart(fig_map, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                fig_map.update_layout(height=470, margin=dict(l=0, r=0, t=54, b=0),
+                                      font=dict(size=14), title_font_size=18,
+                                      geo=dict(bgcolor="#FFFFFF", showframe=False, showcountries=True,
+                                               countrycolor="#CBD5E1", coastlinecolor="#94A3B8"))
+                st.plotly_chart(fig_map, use_container_width=True, config=SLR_PLOT_CONFIG)
             with m2:
                 fig_cb = px.bar(cdf.head(12).sort_values("Dokumen"), x="Dokumen", y="Negara",
                                 orientation="h", color="Dokumen", color_continuous_scale="YlOrRd",
-                                title="12 Negara Teratas")
-                style_publication_figure(fig_cb, height=430)
-                st.plotly_chart(fig_cb, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
-            Gc = _slr_build_cooccurrence(analysis, "Countries", 1, 1, 40)
+                                title="12 Negara Teratas", text="Dokumen")
+                fig_cb.update_traces(textposition="outside")
+                style_publication_figure(fig_cb, height=470)
+                _slr_finalize(fig_cb)
+                st.plotly_chart(fig_cb, use_container_width=True, config=SLR_PLOT_CONFIG)
+            Gc = _slr_build_cooccurrence(analysis, "Countries", 1, 1, 45)
+            intl_pairs = Gc.number_of_edges()
             if Gc.number_of_edges() > 0:
                 st.markdown("**Jaringan Kolaborasi Negara**")
-                fc, _ = _slr_network_figure(Gc, "Ko-kepenulisan Antarnegara", color_mode, height=520)
-                st.plotly_chart(fc, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+                part_c = _slr_communities(Gc)
+                fc, _ = _slr_network_figure(Gc, "Ko-kepenulisan Antarnegara", color_mode, part_c,
+                                            height=max(520, net_height - 160))
+                st.plotly_chart(fc, use_container_width=True, config=SLR_PLOT_CONFIG)
         else:
             st.info("Informasi afiliasi/negara tidak tersedia pada rekaman ini (umumnya hanya ada di Scopus/IEEE).")
+
+        # ----- Tabel Ringkasan RQ3 -----
+        st.markdown("#### 📄 Tabel Ringkasan RQ3 — Struktur Sosial")
+        au_cnt3, au_disp3 = _slr_counter(analysis, "Authors")
+        intl_docs = sum(1 for r in analysis if len(set(r["Countries"])) > 1)
+        top_au3 = au_cnt3.most_common(1)[0] if au_cnt3 else (None, 0)
+        top_cty = cty_cnt.most_common(1)[0] if cty_cnt else ("-", 0)
+        rq3_tbl = pd.DataFrame([
+            ("Penulis unik", f"{len(au_cnt3)}"),
+            ("Penulis paling kolaboratif", f"{au_disp3.get(top_au3[0], '-')} ({top_au3[1]} dok.)" if top_au3[0] else "-"),
+            ("Klaster ko-penulisan (greedy modularity)", f"{len(set(part_a.values())) if part_a else 0}"),
+            ("Negara terlibat", f"{len(cty_cnt)}"),
+            ("Negara paling produktif", f"{top_cty[0]} ({top_cty[1]} dok.)"),
+            ("Pasangan kolaborasi antarnegara", f"{intl_pairs}"),
+            ("Dokumen kolaborasi internasional", f"{intl_docs}"),
+        ], columns=["Indikator (RQ3)", "Nilai"])
+        st.dataframe(rq3_tbl, use_container_width=True, hide_index=True)
+        rq3_download = rq3_tbl.to_csv(index=False).encode("utf-8")
+        if not cdf.empty:
+            rq3_download = (rq3_tbl.to_csv(index=False) + "\n\nProduksi per Negara\n" + cdf.to_csv(index=False)).encode("utf-8")
+        st.download_button("⬇️ Unduh Ringkasan RQ3 (CSV)", rq3_download, "ringkasan_rq3.csv", "text/csv")
         st.caption("Menjawab RQ3: pusat kolaborasi penulis dan negara, serta struktur sosial komunitas riset.")
 
     # ---------------- DATA & DOWNLOAD ----------------

@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import re
 import base64
 import html
 import networkx as nx
@@ -9568,6 +9569,692 @@ def render_centrality_methods_page(
 
 
 # =========================================================
+# 2.9 MODUL ANALISIS SLR (SYSTEMATIC LITERATURE REVIEW)
+#     PRISMA 2020 + Bibliometrik gaya VOSviewer/Biblioshiny
+#     Sumber data: folder ./slr (CSV ekspor Scopus/WoS/IEEE/Google Scholar)
+# =========================================================
+import glob as _glob
+import itertools as _itertools
+from collections import Counter as _Counter, defaultdict as _defaultdict
+
+SLR_DATA_DIR = "slr"
+
+SLR_COUNTRY_LIST = [
+    "United States", "United Kingdom", "China", "India", "Germany", "France", "Italy", "Spain",
+    "Canada", "Australia", "Japan", "South Korea", "Korea", "Brazil", "Russia", "Netherlands",
+    "Switzerland", "Sweden", "Belgium", "Austria", "Norway", "Denmark", "Finland", "Poland",
+    "Portugal", "Greece", "Ireland", "Turkey", "Iran", "Israel", "Saudi Arabia",
+    "United Arab Emirates", "Egypt", "South Africa", "Nigeria", "Kenya", "Malaysia", "Singapore",
+    "Indonesia", "Thailand", "Vietnam", "Philippines", "Pakistan", "Bangladesh", "Mexico",
+    "Argentina", "Chile", "Colombia", "Czech Republic", "Romania", "Hungary", "Ukraine", "Taiwan",
+    "Hong Kong", "New Zealand", "Qatar", "Kuwait", "Jordan", "Morocco", "Tunisia", "Ethiopia",
+    "Ghana", "Sri Lanka", "Nepal", "Slovenia", "Slovakia", "Croatia", "Serbia", "Bulgaria",
+    "Lithuania", "Estonia", "Latvia", "Luxembourg", "Iceland", "Cyprus", "Malta", "Oman",
+    "Bahrain", "Lebanon", "Iraq", "Peru", "Ecuador", "Venezuela", "Uruguay", "Macau", "Macao",
+]
+SLR_COUNTRY_NORMALIZE = {
+    "USA": "United States", "U.S.A.": "United States", "US": "United States", "U.S.": "United States",
+    "United States of America": "United States", "UK": "United Kingdom", "U.K.": "United Kingdom",
+    "England": "United Kingdom", "Scotland": "United Kingdom", "Wales": "United Kingdom",
+    "Korea": "South Korea", "Republic of Korea": "South Korea", "Russian Federation": "Russia",
+    "Viet Nam": "Vietnam", "Czechia": "Czech Republic", "UAE": "United Arab Emirates",
+    "Macao": "Macau",
+}
+_SLR_COUNTRY_SET = set(SLR_COUNTRY_LIST) | set(SLR_COUNTRY_NORMALIZE.keys())
+
+
+def _slr_to_int(x):
+    try:
+        s = str(x).strip()
+        if s in ("", "nan", "None", "NaN"):
+            return None
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _slr_clean_text(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in ("nan", "none", "null"):
+        return ""
+    return s
+
+
+def _slr_norm_title(t):
+    t = _slr_clean_text(t).lower()
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _slr_norm_doi(d):
+    d = _slr_clean_text(d).lower()
+    d = re.sub(r"^https?://(dx\.)?doi\.org/", "", d)
+    return d.replace("doi:", "").strip()
+
+
+def _slr_author_key(name):
+    k = re.sub(r"[^a-z\s]", " ", _slr_clean_text(name).lower())
+    return re.sub(r"\s+", " ", k).strip()
+
+
+def _slr_split_authors(raw, sep="auto"):
+    raw = _slr_clean_text(raw)
+    if not raw:
+        return []
+    raw = raw.replace("…", "").replace("...", "")
+    if sep == "auto":
+        sep = ";" if ";" in raw else ","
+    out = []
+    for p in raw.split(sep):
+        p = re.sub(r"\s+", " ", p.strip(" .,")).strip()
+        if p and p.lower() not in ("et al", "et al.", "and others", "others"):
+            out.append(p)
+    return out
+
+
+def _slr_split_keywords(raw):
+    raw = _slr_clean_text(raw)
+    if not raw:
+        return []
+    out = []
+    for p in re.split(r"[;|]", raw):
+        p = re.sub(r"\s+", " ", p.strip()).strip().lower()
+        if p:
+            out.append(p)
+    return out
+
+
+def _slr_extract_countries(raw):
+    raw = _slr_clean_text(raw)
+    if not raw:
+        return []
+    found = []
+    for seg in raw.split(";"):
+        seg = seg.strip()
+        if not seg:
+            continue
+        hit = None
+        for token in reversed([c.strip() for c in seg.split(",")]):
+            if token in _SLR_COUNTRY_SET:
+                hit = token
+                break
+        if hit is None:
+            for country in _SLR_COUNTRY_SET:
+                if re.search(r"\b" + re.escape(country) + r"\b", seg):
+                    hit = country
+                    break
+        if hit:
+            found.append(SLR_COUNTRY_NORMALIZE.get(hit, hit))
+    return found
+
+
+def _slr_detect_source(cols):
+    cset = set(cols)
+    if {"Cites", "GSRank"} & cset:
+        return "Google Scholar"
+    if "IEEE Terms" in cset or "Document Identifier" in cset:
+        return "IEEE Xplore"
+    if "EID" in cset or "Author full names" in cset or "Cited by" in cset:
+        return "Scopus"
+    if "UT (Unique WOS ID)" in cset or "WoS" in cset:
+        return "Web of Science"
+    return "Lainnya"
+
+
+def _slr_map_row(row, cols, db):
+    def g(*names):
+        for n in names:
+            if n in cols:
+                return row.get(n)
+        return None
+    title = _slr_clean_text(g("Title", "Document Title", "Article Title"))
+    year = _slr_to_int(g("Year", "Publication Year"))
+    cites = _slr_to_int(g("Cited by", "Cites", "Article Citation Count", "Times Cited")) or 0
+    doi = _slr_norm_doi(g("DOI"))
+    abstract = _slr_clean_text(g("Abstract"))
+    source_title = _slr_clean_text(g("Source title", "Publication Title", "Source", "Publisher"))
+    sep = "," if db == "Google Scholar" else "auto"
+    authors = _slr_split_authors(g("Authors", "Author full names"), sep=sep)
+    keywords = _slr_split_keywords(g("Author Keywords"))
+    aff = _slr_clean_text(g("Affiliations", "Author Affiliations", "Authors with affiliations"))
+    countries = _slr_extract_countries(aff)
+    return dict(
+        DB=db, Title=title, Year=year, Cites=cites, DOI=doi, Abstract=abstract,
+        SourceTitle=source_title, Authors=authors, Keywords=keywords,
+        Affiliations=aff, Countries=countries,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def slr_load_raw(data_dir=SLR_DATA_DIR):
+    records, per_db = [], _Counter()
+    for f in sorted(_glob.glob(os.path.join(data_dir, "*.csv"))):
+        df = None
+        for enc in ("utf-8-sig", "latin-1"):
+            try:
+                df = pd.read_csv(f, encoding=enc, dtype=str, on_bad_lines="skip")
+                break
+            except Exception:
+                continue
+        if df is None:
+            continue
+        cols = list(df.columns)
+        db = _slr_detect_source(cols)
+        for _, row in df.iterrows():
+            rec = _slr_map_row(row, cols, db)
+            if not rec["Title"]:
+                continue
+            rec["_file"] = os.path.basename(f)
+            records.append(rec)
+            per_db[db] += 1
+    return records, dict(per_db)
+
+
+def slr_dedupe(records):
+    seen_doi, seen_title, unique, dup = {}, {}, [], 0
+    for rec in records:
+        if rec["DOI"]:
+            key = ("doi", rec["DOI"])
+        else:
+            nt = _slr_norm_title(rec["Title"])
+            key = ("title", nt) if nt else None
+        if key is None:
+            unique.append(rec)
+            continue
+        store = seen_doi if key[0] == "doi" else seen_title
+        if key[1] in store:
+            dup += 1
+            prev = store[key[1]]
+            if (rec["Cites"] or 0) > (prev["Cites"] or 0):
+                prev["Cites"] = rec["Cites"]
+            if not prev["Abstract"] and rec["Abstract"]:
+                prev["Abstract"] = rec["Abstract"]
+            if not prev["Keywords"] and rec["Keywords"]:
+                prev["Keywords"] = rec["Keywords"]
+            if not prev["Countries"] and rec["Countries"]:
+                prev["Countries"] = rec["Countries"]
+        else:
+            store[key[1]] = rec
+            unique.append(rec)
+    return unique, dup
+
+
+def _slr_prisma_figure(c):
+    """Diagram alir PRISMA 2020 memakai shapes plotly."""
+    fig = go.Figure()
+
+    def box(x0, y0, x1, y1, text, fill="#EEF2F7", line="#334155", tcolor="#111827"):
+        fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
+                      line=dict(color=line, width=1.5), fillcolor=fill, layer="below")
+        fig.add_annotation(x=(x0 + x1) / 2, y=(y0 + y1) / 2, text=text, showarrow=False,
+                           font=dict(size=12, color=tcolor), align="center")
+
+    def arrow(x0, y0, x1, y1):
+        fig.add_annotation(x=x1, y=y1, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
+                           showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=1.6,
+                           arrowcolor="#334155", text="")
+
+    main_x0, main_x1 = 0.5, 5.5
+    ex_x0, ex_x1 = 6.5, 11.5
+    # Phase band labels
+    for yb, lbl, col in [(9.1, "IDENTIFICATION", "#1D4ED8"), (6.6, "SCREENING", "#B45309"),
+                         (4.1, "ELIGIBILITY", "#0F766E"), (1.4, "INCLUDED", "#B91C1C")]:
+        fig.add_annotation(x=-0.35, y=yb, text=f"<b>{lbl}</b>", showarrow=False,
+                           textangle=-90, font=dict(size=12, color=col))
+
+    box(main_x0, 9.6, main_x1, 10.8,
+        f"<b>Rekaman teridentifikasi</b><br>dari basis data (n = {c['identified']})<br>"
+        + "<br>".join(f"{k}: {v}" for k, v in c["per_db"].items()),
+        fill="#DBEAFE", line="#1D4ED8")
+    box(main_x0, 7.6, main_x1, 8.6, f"<b>Rekaman setelah duplikat dihapus</b><br>(n = {c['after_dedup']})",
+        fill="#FEF3C7", line="#B45309")
+    box(ex_x0, 7.7, ex_x1, 8.5, f"Duplikat dihapus<br>(n = {c['duplicates']})",
+        fill="#FEE2E2", line="#B91C1C")
+    box(main_x0, 5.6, main_x1, 6.6, f"<b>Rekaman disaring</b><br>(judul & abstrak, n = {c['after_dedup']})",
+        fill="#FEF3C7", line="#B45309")
+    box(ex_x0, 5.7, ex_x1, 6.5, f"Dikeluarkan saat skrining<br>(n = {c['excluded_screen']})<br>"
+        f"<i>tak sesuai kata kunci/tahun</i>", fill="#FEE2E2", line="#B91C1C")
+    box(main_x0, 3.1, main_x1, 4.6, f"<b>Teks lengkap dinilai kelayakan</b><br>(n = {c['eligible']})",
+        fill="#CCFBF1", line="#0F766E")
+    box(ex_x0, 3.3, ex_x1, 4.3, f"Teks lengkap dikeluarkan<br>(n = {c['excluded_eligible']})<br>"
+        f"<i>tanpa abstrak / metadata kurang</i>", fill="#FEE2E2", line="#B91C1C")
+    box(main_x0, 0.7, main_x1, 2.1, f"<b>Studi disertakan dalam sintesis</b><br>(n = {c['included']})",
+        fill="#FECACA", line="#B91C1C", tcolor="#7F1D1D")
+
+    arrow(3.0, 9.6, 3.0, 8.6)
+    arrow(3.0, 7.6, 3.0, 6.6)
+    arrow(3.0, 5.6, 3.0, 4.6)
+    arrow(3.0, 3.1, 3.0, 2.1)
+    arrow(3.0, 8.1, ex_x0, 8.1)
+    arrow(3.0, 6.1, ex_x0, 6.1)
+    arrow(3.0, 3.9, ex_x0, 3.9)
+
+    fig.update_xaxes(visible=False, range=[-0.8, 11.8])
+    fig.update_yaxes(visible=False, range=[0.3, 11.2])
+    fig.update_layout(height=760, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                      margin=dict(l=20, r=20, t=60, b=20),
+                      title=dict(text="Diagram Alir PRISMA 2020", x=0.02, xanchor="left",
+                                 font=dict(size=18, color="#111827")))
+    return fig
+
+
+def _slr_build_cooccurrence(records, field, min_occ, min_edge=1, max_nodes=80):
+    """Bangun graf co-occurrence (keyword) atau co-authorship."""
+    node_docs = _defaultdict(list)
+    node_disp = {}
+    for idx, r in enumerate(records):
+        if field == "Keywords":
+            items = list(dict.fromkeys(r["Keywords"]))
+            keys = [(k, k) for k in items]
+        elif field == "Authors":
+            seen = {}
+            for a in r["Authors"]:
+                k = _slr_author_key(a)
+                if k and k not in seen:
+                    seen[k] = a
+            keys = list(seen.items())
+        else:  # Countries
+            items = list(dict.fromkeys(r["Countries"]))
+            keys = [(k, k) for k in items]
+        for k, disp in keys:
+            node_docs[k].append(idx)
+            node_disp.setdefault(k, disp)
+
+    occ = {k: len(v) for k, v in node_docs.items()}
+    kept = {k for k, n in occ.items() if n >= min_occ}
+    if len(kept) > max_nodes:
+        kept = set(sorted(kept, key=lambda k: occ[k], reverse=True)[:max_nodes])
+
+    G = nx.Graph()
+    for k in kept:
+        yrs = [records[i]["Year"] for i in node_docs[k] if records[i]["Year"]]
+        cites = sum(records[i]["Cites"] or 0 for i in node_docs[k])
+        G.add_node(k, label=node_disp[k], occ=occ[k],
+                   avg_year=(float(np.mean(yrs)) if yrs else None), cites=cites)
+
+    edge_w = _Counter()
+    for idx in range(len(records)):
+        present = [k for k in kept if idx in node_docs[k]]
+        for a, b in _itertools.combinations(sorted(present), 2):
+            edge_w[(a, b)] += 1
+    for (a, b), w in edge_w.items():
+        if w >= min_edge:
+            G.add_edge(a, b, weight=w)
+    return G
+
+
+def _slr_network_figure(G, title, color_mode="cluster", height=640):
+    if G.number_of_nodes() == 0:
+        return None
+    try:
+        partition = community_louvain.best_partition(G, weight="weight", random_state=42) if G.number_of_edges() else {n: 0 for n in G.nodes()}
+    except Exception:
+        partition = {n: 0 for n in G.nodes()}
+    k_val = 1.8 / np.sqrt(max(G.number_of_nodes(), 1))
+    pos = nx.spring_layout(G, weight="weight", seed=42, k=k_val, iterations=120)
+
+    edge_x, edge_y = [], []
+    maxw = max((d["weight"] for _, _, d in G.edges(data=True)), default=1)
+    for a, b, d in G.edges(data=True):
+        edge_x += [pos[a][0], pos[b][0], None]
+        edge_y += [pos[a][1], pos[b][1], None]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines",
+                             line=dict(width=0.6, color="rgba(100,116,139,0.35)"),
+                             hoverinfo="none", showlegend=False))
+
+    occs = np.array([G.nodes[n]["occ"] for n in G.nodes()], dtype=float)
+    smin, smax = occs.min(), occs.max()
+    sizes = 16 + 40 * (occs - smin) / (smax - smin) if smax > smin else np.full_like(occs, 24)
+
+    if color_mode == "overlay":
+        yrs = np.array([G.nodes[n]["avg_year"] if G.nodes[n]["avg_year"] else np.nan for n in G.nodes()])
+        node_color = yrs
+        marker = dict(size=sizes, color=node_color, colorscale="Turbo", showscale=True,
+                      colorbar=dict(title="Rerata Tahun"), line=dict(width=1.2, color="#111827"))
+    else:
+        node_color = [CONTRAST_COLORS[partition[n] % len(CONTRAST_COLORS)] for n in G.nodes()]
+        marker = dict(size=sizes, color=node_color, line=dict(width=1.2, color="#111827"))
+
+    labels = [G.nodes[n]["label"] for n in G.nodes()]
+    hover = [f"<b>{G.nodes[n]['label']}</b><br>Kemunculan: {G.nodes[n]['occ']}"
+             f"<br>Klaster: {partition[n] + 1}"
+             + (f"<br>Rerata tahun: {G.nodes[n]['avg_year']:.1f}" if G.nodes[n]['avg_year'] else "")
+             + f"<br>Total sitasi: {G.nodes[n]['cites']}" for n in G.nodes()]
+    show_lbl = occs >= np.percentile(occs, 55) if len(occs) > 18 else np.ones_like(occs, dtype=bool)
+    fig.add_trace(go.Scatter(
+        x=[pos[n][0] for n in G.nodes()], y=[pos[n][1] for n in G.nodes()],
+        mode="markers+text", marker=marker,
+        text=[lbl if show else "" for lbl, show in zip(labels, show_lbl)],
+        textposition="top center", textfont=dict(size=10, color="#0F172A"),
+        hovertext=hover, hoverinfo="text", showlegend=False))
+    style_network_figure(fig, title=title, height=height)
+    return fig, partition
+
+
+def _slr_counter(records, field):
+    cnt, disp = _Counter(), {}
+    for r in records:
+        if field == "Authors":
+            seen = set()
+            for a in r["Authors"]:
+                k = _slr_author_key(a)
+                if k and k not in seen:
+                    seen.add(k)
+                    cnt[k] += 1
+                    disp.setdefault(k, a)
+        else:
+            val = r[field]
+            if isinstance(val, str):
+                v = val.strip()
+                if v:
+                    cnt[v] += 1
+                    disp.setdefault(v, v)
+            else:
+                for v in dict.fromkeys(val):
+                    cnt[v] += 1
+                    disp.setdefault(v, v)
+    return cnt, disp
+
+
+def _slr_main_info(records):
+    years = [r["Year"] for r in records if r["Year"]]
+    authors = set()
+    coauthor_counts, single = [], 0
+    for r in records:
+        ks = {_slr_author_key(a) for a in r["Authors"] if _slr_author_key(a)}
+        authors |= ks
+        coauthor_counts.append(len(ks))
+        if len(ks) == 1:
+            single += 1
+    kw = {k for r in records for k in r["Keywords"]}
+    srcs = {r["SourceTitle"] for r in records if r["SourceTitle"]}
+    cites = [r["Cites"] or 0 for r in records]
+    rows = [
+        ("Rentang tahun", f"{min(years)}–{max(years)}" if years else "-"),
+        ("Jumlah dokumen", f"{len(records)}"),
+        ("Sumber (jurnal/prosiding)", f"{len(srcs)}"),
+        ("Total penulis (unik)", f"{len(authors)}"),
+        ("Rerata penulis per dokumen", f"{np.mean(coauthor_counts):.2f}" if coauthor_counts else "-"),
+        ("Dokumen penulis tunggal", f"{single}"),
+        ("Kata kunci penulis (unik)", f"{len(kw)}"),
+        ("Rerata sitasi per dokumen", f"{np.mean(cites):.1f}" if cites else "-"),
+        ("Total sitasi", f"{int(np.sum(cites))}"),
+    ]
+    return pd.DataFrame(rows, columns=["Metrik", "Nilai"])
+
+
+def render_slr_analysis_page():
+    st.markdown("<h1 class='main-header'>Analisis SLR — PRISMA 2020 & Bibliometrik</h1>", unsafe_allow_html=True)
+    st.caption(
+        "Basis data diambil otomatis dari folder `slr/` (ekspor CSV Scopus, IEEE Xplore, Google Scholar/Publish or Perish). "
+        "Alur mengikuti panduan PRISMA 2020 (Identification ▸ Screening ▸ Eligibility ▸ Included) "
+        "dan pemetaan sains gaya VOSviewer/Biblioshiny — semuanya dijalankan native di Streamlit."
+    )
+
+    records, per_db = slr_load_raw()
+    if not records:
+        st.error("Tidak ada berkas CSV yang terbaca di folder `slr/`. Pastikan file ekspor tersedia.")
+        return
+    unique, dup = slr_dedupe(records)
+
+    years_all = [r["Year"] for r in unique if r["Year"]]
+    ymin_all, ymax_all = (min(years_all), max(years_all)) if years_all else (2000, 2026)
+
+    with st.sidebar:
+        st.markdown("### 🔎 Filter PRISMA")
+        yr_range = st.slider("Rentang Tahun (Screening)", int(ymin_all), int(ymax_all),
+                             (int(ymin_all), int(ymax_all)))
+        inc_raw = st.text_input("Kata Kunci Inklusi (pisahkan koma)",
+                                help="Dokumen lolos skrining bila judul/abstrak/kata kunci memuat salah satu istilah. Kosongkan untuk meloloskan semua.")
+        req_abstract = st.checkbox("Wajib punya abstrak (Eligibility)", value=True)
+        apply_filter = st.checkbox("Terapkan filter PRISMA ke analisis bibliometrik", value=True)
+        st.markdown("### 🕸️ Parameter Peta Sains")
+        min_kw = st.slider("Min. kemunculan kata kunci", 2, 12, 3)
+        min_au = st.slider("Min. dokumen per penulis", 1, 8, 2)
+        viz_mode = st.radio("Mode Visualisasi Jaringan", ["Network (klaster)", "Overlay (tahun)"], index=0)
+        max_nodes = st.slider("Maks. node jaringan", 20, 120, 70, 5)
+    color_mode = "overlay" if viz_mode.startswith("Overlay") else "cluster"
+
+    inc_terms = [t.strip().lower() for t in inc_raw.split(",") if t.strip()]
+
+    def _passes_screen(r):
+        if r["Year"] is None or not (yr_range[0] <= r["Year"] <= yr_range[1]):
+            return False
+        if inc_terms:
+            hay = (r["Title"] + " " + r["Abstract"] + " " + " ".join(r["Keywords"])).lower()
+            if not any(t in hay for t in inc_terms):
+                return False
+        return True
+
+    excluded_screen = [r for r in unique if not _passes_screen(r)]
+    eligible = [r for r in unique if _passes_screen(r)]
+    if req_abstract:
+        excluded_eligible = [r for r in eligible if not r["Abstract"]]
+        included = [r for r in eligible if r["Abstract"]]
+    else:
+        excluded_eligible, included = [], eligible
+
+    counts = dict(
+        identified=len(records), per_db=per_db, duplicates=dup, after_dedup=len(unique),
+        excluded_screen=len(excluded_screen), eligible=len(eligible),
+        excluded_eligible=len(excluded_eligible), included=len(included),
+    )
+    analysis = included if apply_filter else unique
+    if not analysis:
+        analysis = unique
+
+    tab_prisma, tab_over, tab_concept, tab_social, tab_data = st.tabs(
+        ["📋 PRISMA 2020", "📊 Ikhtisar (RQ1)", "🧠 Struktur Konseptual (RQ2)",
+         "🌐 Struktur Sosial & Intelektual (RQ3)", "🗂️ Data & Unduh"])
+
+    # ---------------- PRISMA ----------------
+    with tab_prisma:
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Teridentifikasi", counts["identified"])
+        k2.metric("Setelah Dedup", counts["after_dedup"])
+        k3.metric("Dinilai Kelayakan", counts["eligible"])
+        k4.metric("Disertakan", counts["included"])
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            st.plotly_chart(_slr_prisma_figure(counts), use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        with c2:
+            st.markdown("**Rekap tiap fase**")
+            phase_df = pd.DataFrame([
+                ("1. Identification", "Rekaman dari basis data", counts["identified"]),
+                ("   ", "→ per basis data", " | ".join(f"{k}={v}" for k, v in per_db.items())),
+                ("2. Deduplikasi", "Duplikat (DOI/judul) dihapus", counts["duplicates"]),
+                ("   ", "Rekaman unik", counts["after_dedup"]),
+                ("3. Screening", "Dikeluarkan (tahun/kata kunci)", counts["excluded_screen"]),
+                ("   ", "Lolos skrining", counts["eligible"]),
+                ("4. Eligibility", "Dikeluarkan (tanpa abstrak/metadata)", counts["excluded_eligible"]),
+                ("5. Included", "Studi final untuk sintesis", counts["included"]),
+            ], columns=["Fase", "Keterangan", "n"])
+            st.dataframe(phase_df, use_container_width=True, hide_index=True)
+            st.markdown(
+                "<div class='soft-card'>Atur <b>rentang tahun</b>, <b>kata kunci inklusi</b>, dan "
+                "syarat abstrak di sidebar untuk memperbarui diagram secara langsung. Gunakan angka ini "
+                "untuk mengisi diagram PRISMA 2020 pada naskah.</div>", unsafe_allow_html=True)
+        with st.expander("Pemetaan langkah panduan ↔ fitur dashboard"):
+            st.markdown(
+                "- **Gabung Scopus + WoS/IEEE + Scholar** → dilakukan otomatis saat memuat semua CSV di `slr/`.\n"
+                "- **Hapus duplikat (DOI/judul)** → deduplikasi otomatis (`duplicatedMatching`-style).\n"
+                "- **Saring judul & abstrak (inklusi/eksklusi)** → filter kata kunci + rentang tahun di sidebar.\n"
+                "- **Nilai kelayakan teks lengkap** → syarat abstrak/metadata pada fase Eligibility.\n"
+                "- **Rekap tiap fase** → tabel & diagram PRISMA di atas.")
+
+    # ---------------- OVERVIEW ----------------
+    with tab_over:
+        st.markdown(f"**Basis analisis:** {'studi terpilih (setelah PRISMA)' if apply_filter else 'seluruh rekaman unik'} — n = {len(analysis)}")
+        cA, cB = st.columns([2, 3])
+        with cA:
+            st.markdown("**Informasi Utama**")
+            st.dataframe(_slr_main_info(analysis), use_container_width=True, hide_index=True)
+            db_series = _Counter(r["DB"] for r in analysis)
+            fig_db = px.pie(values=list(db_series.values()), names=list(db_series.keys()),
+                            title="Komposisi Basis Data", hole=0.45,
+                            color_discrete_sequence=CONTRAST_COLORS)
+            style_publication_figure(fig_db, height=320)
+            st.plotly_chart(fig_db, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        with cB:
+            yr = _Counter(r["Year"] for r in analysis if r["Year"])
+            if yr:
+                ydf = pd.DataFrame(sorted(yr.items()), columns=["Tahun", "Jumlah"])
+                ydf["Kumulatif"] = ydf["Jumlah"].cumsum()
+                fig_y = go.Figure()
+                fig_y.add_bar(x=ydf["Tahun"], y=ydf["Jumlah"], name="Produksi", marker_color="#2563EB")
+                fig_y.add_scatter(x=ydf["Tahun"], y=ydf["Kumulatif"], name="Kumulatif",
+                                  mode="lines+markers", line=dict(color="#B91C1C"), yaxis="y2")
+                fig_y.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                                                title="Kumulatif"))
+                style_publication_figure(fig_y, title="Produksi Ilmiah Tahunan", height=360,
+                                         xaxis_title="Tahun", yaxis_title="Jumlah dokumen")
+                st.plotly_chart(fig_y, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            src_cnt, _ = _slr_counter(analysis, "SourceTitle")
+            top_src = pd.DataFrame(src_cnt.most_common(12), columns=["Sumber", "Jumlah"])
+            if not top_src.empty:
+                fig_s = px.bar(top_src.sort_values("Jumlah"), x="Jumlah", y="Sumber",
+                               orientation="h", color="Jumlah", color_continuous_scale="Blues",
+                               title="Sumber Paling Relevan")
+                style_publication_figure(fig_s, height=380)
+                st.plotly_chart(fig_s, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        c1, c2 = st.columns(2)
+        with c1:
+            au_cnt, au_disp = _slr_counter(analysis, "Authors")
+            top_au = pd.DataFrame([(au_disp[k], v) for k, v in au_cnt.most_common(15)],
+                                  columns=["Penulis", "Dokumen"])
+            if not top_au.empty:
+                fig_a = px.bar(top_au.sort_values("Dokumen"), x="Dokumen", y="Penulis",
+                               orientation="h", color="Dokumen", color_continuous_scale="Teal",
+                               title="Penulis Paling Produktif")
+                style_publication_figure(fig_a, height=430)
+                st.plotly_chart(fig_a, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        with c2:
+            st.markdown("**Dokumen Paling Banyak Disitasi (Global)**")
+            top_cited = sorted(analysis, key=lambda r: r["Cites"] or 0, reverse=True)[:15]
+            tc_df = pd.DataFrame([
+                {"Judul": (r["Title"][:70] + "…") if len(r["Title"]) > 70 else r["Title"],
+                 "Tahun": r["Year"], "Sitasi": r["Cites"], "DB": r["DB"]} for r in top_cited])
+            st.dataframe(tc_df, use_container_width=True, hide_index=True, height=430)
+        st.caption("Menjawab RQ1: dinamika publikasi, sumber & penulis paling berpengaruh, dokumen paling berdampak.")
+
+    # ---------------- CONCEPTUAL ----------------
+    with tab_concept:
+        st.markdown("#### Peta Co-occurrence Kata Kunci Penulis")
+        st.caption("Analog VOSviewer *Co-occurrence of author keywords*. Ukuran node = frekuensi; "
+                   "warna = klaster tema (mode Network) atau rerata tahun (mode Overlay).")
+        Gk = _slr_build_cooccurrence(analysis, "Keywords", min_kw, 1, max_nodes)
+        if Gk.number_of_nodes() == 0:
+            st.info("Belum ada kata kunci yang memenuhi ambang. Turunkan 'Min. kemunculan kata kunci' di sidebar.")
+        else:
+            fk, part_k = _slr_network_figure(Gk, f"Co-occurrence Kata Kunci (min={min_kw})", color_mode, height=660)
+            st.plotly_chart(fk, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            colx, coly = st.columns([3, 2])
+            with colx:
+                kw_cnt, _ = _slr_counter(analysis, "Keywords")
+                top_kw = pd.DataFrame(kw_cnt.most_common(20), columns=["Kata Kunci", "Frekuensi"])
+                fig_tm = px.treemap(top_kw, path=["Kata Kunci"], values="Frekuensi",
+                                    color="Frekuensi", color_continuous_scale="Viridis",
+                                    title="20 Kata Kunci Teratas")
+                fig_tm.update_layout(height=420, margin=dict(l=8, r=8, t=50, b=8))
+                st.plotly_chart(fig_tm, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            with coly:
+                st.markdown("**Klaster Tema (Louvain)**")
+                clusters = _defaultdict(list)
+                for n, c in part_k.items():
+                    clusters[c].append((Gk.nodes[n]["label"], Gk.nodes[n]["occ"]))
+                rows = []
+                for c in sorted(clusters):
+                    items = sorted(clusters[c], key=lambda x: x[1], reverse=True)
+                    rows.append({"Klaster": c + 1,
+                                 "Kata kunci inti": ", ".join(w for w, _ in items[:6]),
+                                 "n": len(items)})
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=420)
+            # keyword trend
+            st.markdown("#### Tren Topik per Tahun (Overlay Temporal)")
+            kw_cnt2, _ = _slr_counter(analysis, "Keywords")
+            top_terms = [k for k, _ in kw_cnt2.most_common(8)]
+            trend_rows = []
+            for r in analysis:
+                if not r["Year"]:
+                    continue
+                for k in set(r["Keywords"]):
+                    if k in top_terms:
+                        trend_rows.append({"Tahun": r["Year"], "Kata Kunci": k})
+            if trend_rows:
+                tdf = pd.DataFrame(trend_rows).groupby(["Tahun", "Kata Kunci"]).size().reset_index(name="Jumlah")
+                fig_tr = px.line(tdf.sort_values("Tahun"), x="Tahun", y="Jumlah", color="Kata Kunci",
+                                 markers=True, color_discrete_sequence=CONTRAST_COLORS,
+                                 title="Perkembangan 8 Kata Kunci Teratas")
+                style_publication_figure(fig_tr, height=380, xaxis_title="Tahun", yaxis_title="Kemunculan")
+                st.plotly_chart(fig_tr, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        st.caption("Menjawab RQ2: struktur tematik, klaster topik, dan pergeseran fokus riset antar waktu.")
+
+    # ---------------- SOCIAL & INTELLECTUAL ----------------
+    with tab_social:
+        st.markdown("#### Jaringan Ko-penulisan (Co-authorship)")
+        st.caption("Analog VOSviewer *Co-authorship (authors)*. Node = penulis; edge = publikasi bersama.")
+        Ga = _slr_build_cooccurrence(analysis, "Authors", min_au, 1, max_nodes)
+        if Ga.number_of_edges() == 0:
+            st.info("Belum ada pasangan penulis yang berkolaborasi pada ambang ini. Turunkan 'Min. dokumen per penulis'.")
+        else:
+            fa, _ = _slr_network_figure(Ga, f"Ko-penulisan (min dok={min_au})", color_mode, height=620)
+            st.plotly_chart(fa, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        st.divider()
+        st.markdown("#### Kolaborasi Antarnegara (Peta Dunia)")
+        cty_cnt, _ = _slr_counter(analysis, "Countries")
+        if cty_cnt:
+            cdf = pd.DataFrame(cty_cnt.most_common(), columns=["Negara", "Dokumen"])
+            m1, m2 = st.columns([3, 2])
+            with m1:
+                fig_map = px.choropleth(cdf, locations="Negara", locationmode="country names",
+                                        color="Dokumen", color_continuous_scale="YlOrRd",
+                                        title="Produksi Ilmiah per Negara")
+                fig_map.update_layout(height=430, margin=dict(l=0, r=0, t=50, b=0),
+                                      geo=dict(bgcolor="#FFFFFF", showframe=False))
+                st.plotly_chart(fig_map, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            with m2:
+                fig_cb = px.bar(cdf.head(12).sort_values("Dokumen"), x="Dokumen", y="Negara",
+                                orientation="h", color="Dokumen", color_continuous_scale="YlOrRd",
+                                title="12 Negara Teratas")
+                style_publication_figure(fig_cb, height=430)
+                st.plotly_chart(fig_cb, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+            Gc = _slr_build_cooccurrence(analysis, "Countries", 1, 1, 40)
+            if Gc.number_of_edges() > 0:
+                st.markdown("**Jaringan Kolaborasi Negara**")
+                fc, _ = _slr_network_figure(Gc, "Ko-kepenulisan Antarnegara", color_mode, height=520)
+                st.plotly_chart(fc, use_container_width=True, config=PLOTLY_DRAW_CONFIG)
+        else:
+            st.info("Informasi afiliasi/negara tidak tersedia pada rekaman ini (umumnya hanya ada di Scopus/IEEE).")
+        st.caption("Menjawab RQ3: pusat kolaborasi penulis dan negara, serta struktur sosial komunitas riset.")
+
+    # ---------------- DATA & DOWNLOAD ----------------
+    with tab_data:
+        st.markdown(f"**Total rekaman gabungan:** {len(records)} | **Unik:** {len(unique)} | **Terpilih:** {len(included)}")
+        table = pd.DataFrame([{
+            "DB": r["DB"], "Judul": r["Title"], "Tahun": r["Year"], "Sitasi": r["Cites"],
+            "Sumber": r["SourceTitle"], "Penulis": "; ".join(r["Authors"][:6]),
+            "Kata Kunci": "; ".join(r["Keywords"][:8]), "Negara": "; ".join(dict.fromkeys(r["Countries"])),
+            "DOI": r["DOI"],
+        } for r in (included if apply_filter else unique)])
+        st.dataframe(table, use_container_width=True, hide_index=True, height=460)
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇️ Unduh dataset terpilih (CSV)", table.to_csv(index=False).encode("utf-8"),
+                           "slr_included.csv", "text/csv", use_container_width=True)
+        prisma_export = pd.DataFrame([
+            ("Identified", counts["identified"]), ("Duplicates removed", counts["duplicates"]),
+            ("After dedup", counts["after_dedup"]), ("Excluded (screening)", counts["excluded_screen"]),
+            ("Eligible (full-text)", counts["eligible"]), ("Excluded (eligibility)", counts["excluded_eligible"]),
+            ("Included", counts["included"]),
+        ], columns=["Fase", "n"])
+        d2.download_button("⬇️ Unduh rekap PRISMA (CSV)", prisma_export.to_csv(index=False).encode("utf-8"),
+                           "prisma_counts.csv", "text/csv", use_container_width=True)
+        st.caption("Ekspor tabel & angka ini untuk lampiran dan bagian Metode/Hasil naskah.")
+
+
+# =========================================================
 # 3. SIDEBAR NAVIGATION
 # =========================================================
 with st.sidebar:
@@ -9601,6 +10288,7 @@ page_mode = st.sidebar.radio(
         "Metode Assortativity",
         "Metode Centrality",
         "Ringkasan Jurnal Q1",
+        "Analisis SLR",
     ],
     index=0,
 )
@@ -9615,6 +10303,10 @@ elif default_data_exists:
 else:
     st.sidebar.warning(f"Data default tidak ditemukan: {DEFAULT_DATA_PATH}")
 render_global_header()
+
+if page_mode == "Analisis SLR":
+    render_slr_analysis_page()
+    st.stop()
 
 if page_mode == "Metode Louvain" and active_data_source is None:
     render_louvain_methods_page(n_nodes=60, rounding_decimals=2, threshold=0.30, seed=42)

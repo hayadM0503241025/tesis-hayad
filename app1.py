@@ -10537,6 +10537,62 @@ def _slr_build_report(analysis, counts, per_db, taxonomy, challenges, apply_filt
     return "\n".join(L)
 
 
+def _slr_build_vosviewer_df(records):
+    """Susun DataFrame data bersih siap-impor VOSviewer.
+
+    Formatnya meniru ekspor CSV Scopus (salah satu opsi baku pada menu
+    VOSviewer ▸ *Create ▸ Map based on bibliographic data ▸ Read data from
+    bibliographic database files ▸ Scopus*). Author, kata kunci, dan
+    author-with-affiliations dipisah dengan '; ' sesuai konvensi Scopus yang
+    diparse VOSviewer. Kolom yang tak tersedia dibiarkan kosong; setiap
+    rekaman diberi EID unik agar tidak digabung keliru oleh VOSviewer.
+    """
+    rows = []
+    for i, r in enumerate(records):
+        authors = [a for a in (r.get("Authors") or []) if a]
+        keywords = [k for k in (r.get("Keywords") or []) if k]
+        aff = r.get("Affiliations") or ""
+        # "Authors with affiliations" gaya Scopus: "Nama, Afiliasi; Nama, Afiliasi"
+        if authors and aff:
+            awa = "; ".join(f"{a}, {aff}" for a in authors)
+        elif authors:
+            awa = "; ".join(authors)
+        else:
+            awa = ""
+        rows.append({
+            "Authors": "; ".join(authors),
+            "Author(s) ID": "",
+            "Title": r.get("Title") or "",
+            "Year": r.get("Year") if r.get("Year") is not None else "",
+            "Source title": r.get("SourceTitle") or "",
+            "Volume": "",
+            "Issue": "",
+            "Art. No.": "",
+            "Page start": "",
+            "Page end": "",
+            "Page count": "",
+            "Cited by": r.get("Cites") if r.get("Cites") is not None else 0,
+            "DOI": r.get("DOI") or "",
+            "Link": (f"https://doi.org/{r['DOI']}" if r.get("DOI") else ""),
+            "Affiliations": aff,
+            "Authors with affiliations": awa,
+            "Abstract": r.get("Abstract") or "",
+            "Author Keywords": "; ".join(keywords),
+            "Index Keywords": "",
+            "Document Type": "Article",
+            "Publication Stage": "Final",
+            "Open Access": "",
+            "Source": "Scopus",
+            "EID": f"2-s2.0-{90000000000 + i}",
+        })
+    cols = ["Authors", "Author(s) ID", "Title", "Year", "Source title", "Volume",
+            "Issue", "Art. No.", "Page start", "Page end", "Page count", "Cited by",
+            "DOI", "Link", "Affiliations", "Authors with affiliations", "Abstract",
+            "Author Keywords", "Index Keywords", "Document Type", "Publication Stage",
+            "Open Access", "Source", "EID"]
+    return pd.DataFrame(rows, columns=cols)
+
+
 def render_slr_analysis_page():
     st.markdown("<h1 class='main-header'>Analisis SLR — PRISMA 2020 & Bibliometrik</h1>", unsafe_allow_html=True)
     st.caption(
@@ -11006,6 +11062,28 @@ def render_slr_analysis_page():
         d2.download_button("⬇️ Unduh rekap PRISMA (CSV)", prisma_export.to_csv(index=False).encode("utf-8"),
                            "prisma_counts.csv", "text/csv", use_container_width=True)
         st.caption("Ekspor tabel & angka ini untuk lampiran dan bagian Metode/Hasil naskah.")
+
+        st.markdown("---")
+        st.markdown("#### 🧭 Data bersih siap VOSviewer")
+        vos_source = included if apply_filter else unique
+        vos_df = _slr_build_vosviewer_df(vos_source)
+        st.caption(
+            f"Berisi {len(vos_df)} rekaman bersih (dedup PRISMA) dalam format kolom ekspor Scopus "
+            "yang dikenali VOSviewer — kolom kunci: Authors, Author Keywords, Source title, "
+            "Cited by, DOI, Abstract, Affiliations."
+        )
+        st.download_button(
+            "⬇️ Unduh data bersih VOSviewer (CSV)",
+            vos_df.to_csv(index=False).encode("utf-8"),
+            "vosviewer_scopus.csv", "text/csv", use_container_width=True,
+            key="slr_vosviewer_download",
+        )
+        st.caption(
+            "**Cara pakai di VOSviewer:** *Create ▸ Map based on bibliographic data ▸ "
+            "Read data from bibliographic database files ▸ tab Scopus ▸ pilih file "
+            "`vosviewer_scopus.csv` ini*. Lalu pilih jenis analisis (Co-authorship, "
+            "Co-occurrence of author keywords, Citation, dll.)."
+        )
 
 
 # =========================================================

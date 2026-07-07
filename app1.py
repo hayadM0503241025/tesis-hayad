@@ -9598,6 +9598,37 @@ SLR_PLOT_CONFIG = {
     "modeBarButtonsToAdd": ["drawline", "drawrect", "drawcircle", "eraseshape"],
 }
 
+# Taksonomi metode/aplikasi (RQ4) — pola istilah dicocokkan ke judul+abstrak+kata kunci
+SLR_TAXONOMY = [
+    ("Prediksi tautan & penyempurnaan KG", [
+        "link prediction", "knowledge graph completion", "kg completion", "knowledge graph embedding",
+        "entity alignment", "relation extraction", "relation prediction", "triple"]),
+    ("Deteksi komunitas berbasis GNN", [
+        "community detection", "graph neural network", "gnn", "graph convolutional", "gcn",
+        "node classification", "graph representation", "node embedding", "graph attention"]),
+    ("Sistem rekomendasi berbasis KG", [
+        "recommender", "recommendation", "recommender system", "collaborative filtering"]),
+    ("Deteksi misinformasi/bot berbasis graf sosial", [
+        "fake news", "misinformation", "disinformation", "rumor", "rumour", "bot detection",
+        "social bot", "fraud", "anomaly detection", "fake account", "spam"]),
+    ("Integrasi KG + LLM (GraphRAG/penalaran)", [
+        "large language model", "llm", "graphrag", "graph rag", "retrieval augmented",
+        "language model", "reasoning", "question answering"]),
+    ("Pembelajaran graf lanjutan (SSL/contrastive)", [
+        "contrastive learning", "graph contrastive", "self-supervised", "self supervised",
+        "representation learning", "pre-training", "pretraining"]),
+]
+# Tantangan/celah (RQ4)
+SLR_CHALLENGES = [
+    ("Skalabilitas", ["scalab", "large-scale", "large scale", "efficien", "complexity", "real-time"]),
+    ("Heterogenitas/multimodal", ["heterogen", "multimodal", "multi-modal", "cross-domain", "multi-relational"]),
+    ("Kualitas & ketersediaan data", ["data quality", "sparse", "sparsity", "noisy", "incomplete",
+                                      "cold start", "cold-start", "imbalance", "label"]),
+    ("Keterjelasan (explainability)", ["explainab", "interpretab", "transparen", "trustworth"]),
+    ("Etika, privasi & keamanan", ["privacy", "ethic", "fairness", "bias", "security", "adversarial", "robust"]),
+    ("Dinamika/temporal", ["dynamic", "temporal", "evolving", "streaming", "time-aware", "time series"]),
+]
+
 SLR_COUNTRY_LIST = [
     "United States", "United Kingdom", "China", "India", "Germany", "France", "Italy", "Spain",
     "Canada", "Australia", "Japan", "South Korea", "Korea", "Brazil", "Russia", "Netherlands",
@@ -9711,6 +9742,10 @@ def _slr_extract_countries(raw):
 
 def _slr_detect_source(cols):
     cset = set(cols)
+    if "Lens ID" in cset or "Lens URL" in cset:
+        return "Lens"
+    if "Dimensions URL" in cset or "Publication ID" in cset:
+        return "Dimensions"
     if {"Cites", "GSRank"} & cset:
         return "Google Scholar"
     if "IEEE Terms" in cset or "Document Identifier" in cset:
@@ -9722,23 +9757,56 @@ def _slr_detect_source(cols):
     return "Lainnya"
 
 
+def _slr_split_country_list(raw):
+    """Kolom negara berdelimit (Dimensions/Lens) → daftar negara ternormalisasi."""
+    raw = _slr_clean_text(raw)
+    if not raw:
+        return []
+    out = []
+    for seg in re.split(r"[;|]", raw):
+        c = seg.strip()
+        if not c:
+            continue
+        out.append(SLR_COUNTRY_NORMALIZE.get(c, c))
+    return out
+
+
 def _slr_map_row(row, cols, db):
     def g(*names):
         for n in names:
-            if n in cols:
+            if n in cols and _slr_clean_text(row.get(n)):
                 return row.get(n)
         return None
     title = _slr_clean_text(g("Title", "Document Title", "Article Title"))
-    year = _slr_to_int(g("Year", "Publication Year"))
-    cites = _slr_to_int(g("Cited by", "Cites", "Article Citation Count", "Times Cited")) or 0
+    year = _slr_to_int(g("Year", "Publication Year", "PubYear"))
+    if year is None:
+        d = _slr_clean_text(g("Publication Date", "Date Published", "Date Added To Xplore", "Online Date"))
+        m = re.search(r"(19|20)\d{2}", d)
+        year = int(m.group()) if m else None
+    cites = _slr_to_int(g("Cited by", "Cites", "Article Citation Count", "Times Cited",
+                          "Times cited", "Citing Works Count", "Citing Patents Count")) or 0
     doi = _slr_norm_doi(g("DOI"))
     abstract = _slr_clean_text(g("Abstract"))
-    source_title = _slr_clean_text(g("Source title", "Publication Title", "Source", "Publisher"))
+    source_title = _slr_clean_text(g("Source title", "Source Title", "Publication Title", "Source", "Publisher"))
     sep = "," if db == "Google Scholar" else "auto"
-    authors = _slr_split_authors(g("Authors", "Author full names"), sep=sep)
-    keywords = _slr_split_keywords(g("Author Keywords"))
-    aff = _slr_clean_text(g("Affiliations", "Author Affiliations", "Authors with affiliations"))
-    countries = _slr_extract_countries(aff)
+    authors = _slr_split_authors(g("Authors", "Author/s", "Author full names"), sep=sep)
+    # Kata kunci: prioritas author keywords, lalu fallback (Lens Keywords / Fields, Dimensions MeSH/FoR)
+    keywords = (_slr_split_keywords(g("Author Keywords"))
+                or _slr_split_keywords(g("Keywords"))
+                or _slr_split_keywords(g("Index Keywords"))
+                or _slr_split_keywords(g("Fields of Study", "Fields of Research (ANZSRC 2020)",
+                                         "MeSH terms", "Mesh_Terms", "IEEE Terms")))
+    # Negara: pakai kolom khusus bila ada (Dimensions), jika tidak parse dari afiliasi
+    country_col = g("Country of standardized research organization", "Countries",
+                    "Country of Research organization")
+    if country_col:
+        countries = _slr_split_country_list(country_col)
+    else:
+        aff = g("Affiliations", "Author Affiliations", "Authors with affiliations",
+                "Authors Affiliations", "Research Organizations - standardized")
+        countries = _slr_extract_countries(_slr_clean_text(aff))
+    aff = _slr_clean_text(g("Affiliations", "Author Affiliations", "Authors with affiliations",
+                            "Authors Affiliations", "Research Organizations - standardized"))
     return dict(
         DB=db, Title=title, Year=year, Cites=cites, DOI=doi, Abstract=abstract,
         SourceTitle=source_title, Authors=authors, Keywords=keywords,
@@ -10193,6 +10261,266 @@ def _slr_finalize(fig, height=None, legend_bottom=False):
     return fig
 
 
+def _slr_annual_growth(years):
+    """CAGR produksi tahunan dari tahun awal hingga tahun puncak produksi.
+
+    Memakai tahun puncak (bukan tahun terakhir) agar tidak bias oleh tahun terkini
+    yang belum lengkap terindeks (indexing lag). Mengembalikan (cagr_persen, ypeak).
+    """
+    ys = [y for y in years if y]
+    if len(ys) < 2:
+        return None, None
+    ser = pd.Series(ys).value_counts().sort_index()
+    yfirst = int(ser.index.min())
+    ypeak = int(ser.idxmax())
+    if ypeak <= yfirst:
+        ypeak = int(ser.index.max())
+    if ypeak <= yfirst:
+        return None, None
+    n0, n1 = float(ser.loc[yfirst]), float(ser.loc[ypeak])
+    if n0 <= 0 or n1 <= 0:
+        return None, None
+    return ((n1 / n0) ** (1.0 / (ypeak - yfirst)) - 1.0) * 100.0, ypeak
+
+
+def _slr_doc_text(r):
+    return (r["Title"] + " " + r["Abstract"] + " " + " ".join(r["Keywords"])).lower()
+
+
+def _slr_taxonomy_counts(records, taxonomy):
+    total = len(records)
+    texts = [_slr_doc_text(r) for r in records]
+    rows = []
+    for label, terms in taxonomy:
+        hit = sum(1 for t in texts if any(term in t for term in terms))
+        rows.append({"Kategori": label, "Jumlah Dokumen": hit,
+                     "Persentase": round(100 * hit / total, 1) if total else 0.0})
+    return pd.DataFrame(rows).sort_values("Jumlah Dokumen", ascending=False).reset_index(drop=True)
+
+
+def _slr_thematic_map(G, part):
+    """Peta tematik Callon (sentralitas × densitas) → motor/niche/basic/emerging."""
+    clusters = _defaultdict(list)
+    for nkey, c in part.items():
+        clusters[c].append(nkey)
+    rows = []
+    for c, members in clusters.items():
+        mset = set(members)
+        internal, external = 0.0, 0.0
+        for a, b, d in G.edges(data=True):
+            a_in, b_in = a in mset, b in mset
+            if a_in and b_in:
+                internal += d["weight"]
+            elif a_in or b_in:
+                external += d["weight"]
+        n_kw = len(members)
+        centrality = 10.0 * external
+        density = (internal / n_kw) if n_kw else 0.0
+        items = sorted(members, key=lambda x: G.nodes[x]["occ"], reverse=True)
+        yrs = [G.nodes[x]["avg_year"] for x in members if G.nodes[x]["avg_year"]]
+        rows.append({
+            "cluster": c + 1,
+            "label": G.nodes[items[0]]["label"],
+            "tema": ", ".join(G.nodes[x]["label"] for x in items[:4]),
+            "centrality": centrality,
+            "density": density,
+            "occ": int(sum(G.nodes[x]["occ"] for x in members)),
+            "n": n_kw,
+            "avg_year": round(float(np.mean(yrs)), 1) if yrs else None,
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return None, df
+    cx = df["centrality"].median()
+    cy = df["density"].median()
+
+    def quadrant(r):
+        hi_c, hi_d = r["centrality"] >= cx, r["density"] >= cy
+        if hi_c and hi_d:
+            return "Motor (penting & berkembang)"
+        if not hi_c and hi_d:
+            return "Niche (khusus & terspesialisasi)"
+        if hi_c and not hi_d:
+            return "Basic (dasar & lintas tema)"
+        return "Emerging/Declining (baru/menurun)"
+
+    df["Kuadran"] = df.apply(quadrant, axis=1)
+    quad_color = {
+        "Motor (penting & berkembang)": "#2E86AB",
+        "Niche (khusus & terspesialisasi)": "#7B2CBF",
+        "Basic (dasar & lintas tema)": "#3BB273",
+        "Emerging/Declining (baru/menurun)": "#E4572E",
+    }
+    fig = go.Figure()
+    fig.add_vline(x=cx, line=dict(color="#94A3B8", dash="dash"))
+    fig.add_hline(y=cy, line=dict(color="#94A3B8", dash="dash"))
+    smax = df["occ"].max() or 1
+    for quad, sub in df.groupby("Kuadran"):
+        fig.add_trace(go.Scatter(
+            x=sub["centrality"], y=sub["density"], mode="markers+text",
+            marker=dict(size=24 + 46 * sub["occ"] / smax, color=quad_color.get(quad, "#64748B"),
+                        line=dict(width=1.5, color="#0f172a"), opacity=0.82),
+            text=sub["label"], textposition="middle center",
+            textfont=dict(size=11, color="#0b1220"),
+            name=quad,
+            hovertext=[f"<b>{r.label}</b><br>Tema: {r.tema}<br>Sentralitas: {r.centrality:.1f}"
+                       f"<br>Densitas: {r.density:.2f}<br>Kemunculan: {r.occ}"
+                       for r in sub.itertuples()],
+            hoverinfo="text"))
+    xr = df["centrality"].max() - df["centrality"].min() or 1
+    yr = df["density"].max() - df["density"].min() or 1
+    ann = [("Motor", df["centrality"].max(), df["density"].max()),
+           ("Niche", df["centrality"].min(), df["density"].max()),
+           ("Basic", df["centrality"].max(), df["density"].min()),
+           ("Emerging/Declining", df["centrality"].min(), df["density"].min())]
+    for txt, ax, ay in ann:
+        fig.add_annotation(x=ax, y=ay, text=f"<i>{txt}</i>", showarrow=False,
+                           font=dict(size=13, color="#64748B"), opacity=0.7)
+    style_publication_figure(fig, title="Peta Tematik (Sentralitas × Densitas)", height=560,
+                             xaxis_title="Sentralitas (relevansi antar-tema)",
+                             yaxis_title="Densitas (perkembangan internal)")
+    fig.update_layout(font=dict(size=15), title_font_size=20,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    return fig, df
+
+
+def _slr_bridge_actors(G, part, top=10):
+    """Aktor jembatan: betweenness centrality tertinggi pada jaringan ko-penulisan."""
+    if G.number_of_edges() == 0:
+        return pd.DataFrame(columns=["Penulis", "Betweenness", "Klaster", "Dokumen"])
+    bt = nx.betweenness_centrality(G, weight="weight", normalized=True)
+    rows = [{"Penulis": G.nodes[n]["label"], "Betweenness": round(bt[n], 3),
+             "Klaster": part.get(n, 0) + 1, "Dokumen": G.nodes[n]["occ"]} for n in G.nodes()]
+    return pd.DataFrame(rows).sort_values("Betweenness", ascending=False).head(top).reset_index(drop=True)
+
+
+def _slr_build_report(analysis, counts, per_db, taxonomy, challenges, apply_filter, min_au, max_nodes):
+    """Rakit draf 'Hasil dan Pembahasan' (RQ1–RQ4 + Kesimpulan) dari angka nyata."""
+    n = len(analysis)
+    years = [r["Year"] for r in analysis if r["Year"]]
+    ymin, ymax = (min(years), max(years)) if years else (None, None)
+    n_years = (ymax - ymin + 1) if years else 0
+    cagr, ypeak = _slr_annual_growth(years)
+    cites = [r["Cites"] or 0 for r in analysis]
+    total_cites, avg_cites = int(np.sum(cites)), (np.mean(cites) if cites else 0)
+    src_cnt, _ = _slr_counter(analysis, "SourceTitle")
+    au_cnt, au_disp = _slr_counter(analysis, "Authors")
+    cty_cnt, _ = _slr_counter(analysis, "Countries")
+    kw_cnt, _ = _slr_counter(analysis, "Keywords")
+    n_src = len({r["SourceTitle"] for r in analysis if r["SourceTitle"]})
+    top_src = src_cnt.most_common(3)
+    top_au = au_cnt.most_common(3)
+    top_cty = cty_cnt.most_common(5)
+    top_kw = kw_cnt.most_common(10)
+    top_cited = sorted(analysis, key=lambda r: r["Cites"] or 0, reverse=True)[:3]
+    db_txt = ", ".join(f"{k} ({v})" for k, v in per_db.items())
+
+    # Struktur konseptual (klaster + peta tematik)
+    Gk = _slr_build_cooccurrence(analysis, "Keywords", 3, 1, 120)
+    part_k = _slr_communities(Gk)
+    _, theme_df = _slr_thematic_map(Gk, part_k)
+    n_clusters = len(set(part_k.values())) if part_k else 0
+    motor = niche = basic = emerg = []
+    if theme_df is not None and not theme_df.empty:
+        motor = theme_df[theme_df["Kuadran"].str.startswith("Motor")]["label"].tolist()
+        niche = theme_df[theme_df["Kuadran"].str.startswith("Niche")]["label"].tolist()
+        basic = theme_df[theme_df["Kuadran"].str.startswith("Basic")]["label"].tolist()
+        emerg = theme_df[theme_df["Kuadran"].str.startswith("Emerging")]["label"].tolist()
+
+    # Struktur sosial (ko-penulisan + jembatan)
+    Ga = _slr_build_cooccurrence(analysis, "Authors", min_au, 1, max_nodes)
+    part_a = _slr_communities(Ga)
+    bridge = _slr_bridge_actors(Ga, part_a, top=3)
+    n_au_comm = len(set(part_a.values())) if part_a else 0
+    intl_docs = sum(1 for r in analysis if len(set(r["Countries"])) > 1)
+
+    tax_df = _slr_taxonomy_counts(analysis, taxonomy)
+    ch_df = _slr_taxonomy_counts(analysis, challenges)
+    gaps = ch_df.sort_values("Jumlah Dokumen").head(2)["Kategori"].tolist()
+
+    def _srclist(lst):
+        return "; ".join(f"*{name}* ({c})" for name, c in lst) if lst else "—"
+
+    def _themelist(lst):
+        return ", ".join(f"**{t}**" for t in lst) if lst else "tidak teridentifikasi"
+
+    L = []
+    L.append("## 3. HASIL DAN PEMBAHASAN\n")
+    basis = "studi terpilih setelah proses PRISMA" if apply_filter else "seluruh rekaman unik"
+    L.append(f"Analisis didasarkan pada **{n} dokumen** ({basis}) hasil penggabungan basis data "
+             f"{db_txt}, setelah identifikasi ({counts['identified']}), penghapusan duplikat "
+             f"({counts['duplicates']}), penyaringan, dan penilaian kelayakan mengikuti PRISMA 2020.\n")
+
+    L.append("### 3.1. Analisis Performa (RQ1)\n")
+    L.append(
+        f"Korpus final terdiri atas **{n} dokumen** yang terbit pada rentang "
+        f"**{ymin}–{ymax}**" + (f" dengan laju pertumbuhan tahunan (CAGR produksi hingga puncak {ypeak}) sekitar **{cagr:.1f}%**" if cagr else "") +
+        f", tersebar pada **{n_src} sumber** (jurnal/konferensi) dan mengumpulkan "
+        f"**{total_cites} sitasi** (rata-rata **{avg_cites:.1f} sitasi/dokumen**). "
+        f"Sumber paling produktif adalah {_srclist(top_src)}. "
+        f"Penulis paling produktif meliputi "
+        + (", ".join(f"**{au_disp.get(k, k)}** ({v})" for k, v in top_au) if top_au else "—")
+        + ". Secara geografis, kontribusi terbesar berasal dari "
+        + (", ".join(f"**{c}** ({v})" for c, v in top_cty) if top_cty else "—")
+        + ". Dokumen paling berpengaruh (sitasi tertinggi) antara lain: "
+        + ("; ".join(f"\"{d['Title'][:80]}\" ({d['Cites']} sitasi, {d['Year']})" for d in top_cited) if top_cited else "—")
+        + ".\n")
+
+    L.append("### 3.2. Struktur Konseptual — Analisis Co-word (RQ2)\n")
+    L.append(
+        f"Analisis co-occurrence kata kunci penulis membentuk **{n_clusters} klaster tematik** utama. "
+        f"Kata kunci paling sering muncul adalah "
+        + (", ".join(f"**{k}** ({v})" for k, v in top_kw[:6]) if top_kw else "—")
+        + f". Berdasarkan peta tematik (sumbu sentralitas–densitas), diperoleh: "
+        f"tema **motor** — {_themelist(motor)}; tema **niche** (khusus) — {_themelist(niche)}; "
+        f"tema **dasar (basic)** — {_themelist(basic)}; serta tema **baru/menurun (emerging/declining)** — {_themelist(emerg)}. "
+        f"Tema motor menunjukkan topik yang matang sekaligus sentral bagi bidang, sedangkan tema emerging "
+        f"mengindikasikan arah yang mulai tumbuh dan layak dieksplorasi lebih lanjut.\n")
+
+    L.append("### 3.3. Struktur Intelektual dan Sosial (RQ3)\n")
+    bridge_names = ", ".join(f"**{r.Penulis}**" for r in bridge.itertuples()) if not bridge.empty else "—"
+    L.append(
+        f"Jaringan ko-penulisan memuat **{len(au_cnt)} penulis** yang terorganisasi ke dalam "
+        f"**{n_au_comm} komunitas kolaborasi** (deteksi komunitas greedy modularity). "
+        f"Aktor jembatan dengan *betweenness* tertinggi — yaitu penulis yang menghubungkan komunitas berbeda — "
+        f"adalah {bridge_names}. Pada tingkat negara, kolaborasi melibatkan **{len(cty_cnt)} negara** "
+        f"dengan **{intl_docs} dokumen** hasil kolaborasi internasional; "
+        + (f"pusat kolaborasi didominasi oleh **{top_cty[0][0]}**. " if top_cty else "")
+        + "Basis intelektual bidang diproksikan melalui dokumen paling berpengaruh dan keterkaitan ko-kata kunci, "
+        "karena analisis co-citation dan bibliographic coupling penuh memerlukan daftar referensi tiap artikel "
+        "yang tidak tersedia pada ekspor basis data yang digunakan.\n")
+
+    L.append("### 3.4. Taksonomi Metode, Aplikasi, dan Celah (RQ4)\n")
+    tax_txt = "; ".join(f"**{r['Kategori']}** ({r['Jumlah Dokumen']} dok., {r['Persentase']}%)"
+                        for _, r in tax_df.iterrows())
+    ch_txt = "; ".join(f"{r['Kategori']} ({r['Jumlah Dokumen']})" for _, r in ch_df.iterrows())
+    L.append(
+        f"Sintesis pendekatan yang berulang muncul, terurut dari yang paling dominan: {tax_txt}. "
+        f"Adapun tantangan yang paling banyak disinggung: {ch_txt}. "
+        f"Celah paling menonjol terdapat pada aspek **{', '.join(gaps)}** yang relatif jarang dibahas, "
+        f"sehingga menjadi peluang agenda penelitian ke depan — khususnya integrasi Knowledge Graph dengan "
+        f"model bahasa besar (GraphRAG/penalaran), penanganan skalabilitas dan heterogenitas data, "
+        f"serta aspek keterjelasan dan etika pada perpotongan SNA–Knowledge Graph.\n")
+
+    L.append("## 4. KESIMPULAN\n")
+    L.append(
+        f"Kajian atas **{n} studi** ({ymin}–{ymax}) menunjukkan: (RQ1) bidang tumbuh"
+        + (f" ~{cagr:.1f}% per tahun" if cagr else "") +
+        f" dengan sumber utama {top_src[0][0] if top_src else '—'} dan kontributor terkemuka "
+        f"{(au_disp.get(top_au[0][0], top_au[0][0]) if top_au else '—')}; "
+        f"(RQ2) terbentuk {n_clusters} klaster tematik dengan tema motor {_themelist(motor)}; "
+        f"(RQ3) struktur kolaborasi terpusat pada {len(cty_cnt)} negara dan {n_au_comm} komunitas penulis "
+        f"dengan aktor jembatan {bridge_names}; serta (RQ4) pendekatan dominan berpusat pada "
+        f"{tax_df.iloc[0]['Kategori'] if not tax_df.empty else '—'} dengan celah pada {', '.join(gaps)}. "
+        f"Keterbatasan kajian mencakup cakupan basis data dan rentang waktu ({ymin}–{ymax}), "
+        f"ketiadaan data referensi untuk co-citation, serta ketergantungan pada kata kunci penulis. "
+        f"Temuan ini memberi peta jalan bagi peneliti dan praktisi untuk memprioritaskan arah riset "
+        f"yang belum tergarap pada irisan SNA dan Knowledge Graph.\n")
+
+    L.append("\n---\n*Draf ini dihasilkan otomatis oleh dashboard; verifikasi angka dan sunting gaya bahasa sebelum publikasi.*")
+    return "\n".join(L)
+
+
 def render_slr_analysis_page():
     st.markdown("<h1 class='main-header'>Analisis SLR — PRISMA 2020 & Bibliometrik</h1>", unsafe_allow_html=True)
     st.caption(
@@ -10276,9 +10604,10 @@ def render_slr_analysis_page():
     if not analysis:
         analysis = unique
 
-    tab_prisma, tab_over, tab_concept, tab_social, tab_data = st.tabs(
-        ["📋 PRISMA 2020", "📊 Ikhtisar (RQ1)", "🧠 Struktur Konseptual (RQ2)",
-         "🌐 Struktur Sosial & Intelektual (RQ3)", "🗂️ Data & Unduh"])
+    tab_prisma, tab_over, tab_concept, tab_social, tab_tax, tab_report, tab_data = st.tabs(
+        ["📋 PRISMA 2020", "📊 RQ1 Performa", "🧠 RQ2 Struktur Konseptual",
+         "🌐 RQ3 Struktur Sosial & Intelektual", "🧩 RQ4 Taksonomi & Celah",
+         "📝 Hasil & Pembahasan", "🗂️ Data & Unduh"])
 
     # ---------------- PRISMA ----------------
     with tab_prisma:
@@ -10384,12 +10713,11 @@ def render_slr_analysis_page():
         src_top = src_cnt.most_common(1)[0] if src_cnt else ("-", 0)
         au_top = au_cnt.most_common(1)[0] if au_cnt else (None, 0)
         top_doc = top_cited[0] if top_cited else None
-        n_years = (max(years_a) - min(years_a) + 1) if years_a else 0
-        cagr = ((len(analysis) ** (1 / n_years) - 1) * 100) if n_years > 1 and len(analysis) > 0 else 0
+        cagr, ypeak = _slr_annual_growth(years_a)
         rq1_tbl = pd.DataFrame([
             ("Periode publikasi", f"{min(years_a)}–{max(years_a)}" if years_a else "-"),
             ("Jumlah studi dianalisis", f"{len(analysis)}"),
-            ("Laju pertumbuhan tahunan (proksi)", f"{cagr:.1f}%"),
+            ("Laju pertumbuhan tahunan (CAGR s.d. puncak)", f"{cagr:.1f}% (hingga {ypeak})" if cagr is not None else "-"),
             ("Jumlah sumber unik", f"{len({r['SourceTitle'] for r in analysis if r['SourceTitle']})}"),
             ("Sumber paling produktif", f"{src_top[0]} ({src_top[1]} dok.)"),
             ("Penulis paling produktif", f"{au_disp.get(au_top[0], '-')} ({au_top[1]} dok.)" if au_top[0] else "-"),
@@ -10414,7 +10742,7 @@ def render_slr_analysis_page():
             st.info("Belum ada kata kunci yang memenuhi ambang. Turunkan 'Min. kemunculan kata kunci' di sidebar.")
         else:
             part_k = _slr_communities(Gk)
-            fk, _ = _slr_network_figure(Gk, f"Co-occurrence Kata Kunci (min={min_kw})", color_mode, part_k, height=net_height)
+            fk, _ = _slr_network_figure(Gk, "Co-occurrence Kata Kunci Penulis", color_mode, part_k, height=net_height)
             st.plotly_chart(fk, use_container_width=True, config=SLR_PLOT_CONFIG)
             colx, coly = st.columns([3, 2])
             with colx:
@@ -10475,7 +10803,27 @@ def render_slr_analysis_page():
             st.dataframe(rq2_tbl, use_container_width=True, hide_index=True)
             st.download_button("⬇️ Unduh Ringkasan RQ2 (CSV)", rq2_tbl.to_csv(index=False).encode("utf-8"),
                                "ringkasan_rq2.csv", "text/csv")
-        st.caption("Menjawab RQ2: struktur tematik, klaster topik, dan pergeseran fokus riset antar waktu.")
+
+            # ----- Peta Tematik (thematic map) -----
+            st.markdown("#### 🗺️ Peta Tematik (Thematic Map)")
+            st.caption("Analog Biblioshiny *Thematic Map*. Sumbu **sentralitas** (relevansi antar-tema) "
+                       "dan **densitas** (perkembangan internal) membagi tema menjadi empat kuadran: "
+                       "**Motor** (kanan atas), **Niche** (kiri atas), **Basic** (kanan bawah), "
+                       "**Emerging/Declining** (kiri bawah).")
+            Gk_theme = _slr_build_cooccurrence(analysis, "Keywords", max(2, min_kw - 1), 1, 120)
+            part_theme = _slr_communities(Gk_theme)
+            fig_theme, theme_df = _slr_thematic_map(Gk_theme, part_theme)
+            if fig_theme is not None:
+                st.plotly_chart(fig_theme, use_container_width=True, config=SLR_PLOT_CONFIG)
+                show_theme = theme_df[["Kuadran", "tema", "occ", "n", "avg_year"]].rename(
+                    columns={"tema": "Tema (kata kunci inti)", "occ": "Total kemunculan",
+                             "n": "Jumlah kata kunci", "avg_year": "Rerata tahun"})
+                st.dataframe(show_theme, use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Unduh klasifikasi tema (CSV)", show_theme.to_csv(index=False).encode("utf-8"),
+                                   "peta_tematik.csv", "text/csv")
+            else:
+                st.info("Belum cukup kata kunci untuk membentuk peta tematik.")
+        st.caption("Menjawab RQ2: struktur tematik, klaster topik, peta tematik, dan pergeseran fokus riset antar waktu.")
 
     # ---------------- SOCIAL & INTELLECTUAL ----------------
     with tab_social:
@@ -10486,11 +10834,18 @@ def render_slr_analysis_page():
         if Ga.number_of_edges() == 0:
             st.info("Belum ada pasangan penulis yang berkolaborasi pada ambang ini. Turunkan 'Min. dokumen per penulis'.")
         else:
-            fa, _ = _slr_network_figure(Ga, f"Ko-penulisan (min dok={min_au})", color_mode, part_a, height=net_height)
+            fa, _ = _slr_network_figure(Ga, "Jaringan Ko-penulisan (Co-authorship)", color_mode, part_a, height=net_height)
             st.plotly_chart(fa, use_container_width=True, config=SLR_PLOT_CONFIG)
-            with st.expander("Daftar penulis & metrik jaringan (CSV siap unduh)"):
+            b1, b2 = st.columns([2, 3])
+            with b1:
+                st.markdown("**Aktor Jembatan (Betweenness tertinggi)**")
+                bridge_df = _slr_bridge_actors(Ga, part_a, top=10)
+                st.dataframe(bridge_df, use_container_width=True, hide_index=True, height=330)
+                st.caption("Betweenness tinggi = penulis yang menjembatani komunitas kolaborasi berbeda.")
+            with b2:
+                st.markdown("**Daftar penulis & metrik jaringan**")
                 au_tbl = _slr_node_table(Ga, part_a)
-                st.dataframe(au_tbl, use_container_width=True, hide_index=True, height=340)
+                st.dataframe(au_tbl, use_container_width=True, hide_index=True, height=330)
                 st.download_button("⬇️ Unduh item penulis (CSV)", au_tbl.to_csv(index=False).encode("utf-8"),
                                    "slr_author_nodes.csv", "text/csv")
         st.divider()
@@ -10549,7 +10904,62 @@ def render_slr_analysis_page():
         if not cdf.empty:
             rq3_download = (rq3_tbl.to_csv(index=False) + "\n\nProduksi per Negara\n" + cdf.to_csv(index=False)).encode("utf-8")
         st.download_button("⬇️ Unduh Ringkasan RQ3 (CSV)", rq3_download, "ringkasan_rq3.csv", "text/csv")
-        st.caption("Menjawab RQ3: pusat kolaborasi penulis dan negara, serta struktur sosial komunitas riset.")
+        st.caption("Menjawab RQ3: pusat kolaborasi penulis dan negara, aktor jembatan, serta struktur sosial komunitas riset. "
+                   "Catatan: co-citation & bibliographic coupling penuh memerlukan daftar referensi tiap artikel "
+                   "(tidak tersedia pada ekspor ini), sehingga struktur intelektual diproksikan lewat dokumen paling berpengaruh dan ko-kata kunci.")
+
+    # ---------------- RQ4 TAKSONOMI ----------------
+    with tab_tax:
+        st.markdown("#### Taksonomi Metode & Aplikasi (RQ4)")
+        st.caption("Sintesis otomatis pendekatan berulang: pola istilah dicocokkan pada judul + abstrak + kata kunci "
+                   "tiap studi terpilih. Satu dokumen dapat masuk lebih dari satu kategori.")
+        tax_df = _slr_taxonomy_counts(analysis, SLR_TAXONOMY)
+        t1, t2 = st.columns([3, 2])
+        with t1:
+            fig_tax = px.bar(tax_df.sort_values("Jumlah Dokumen"), x="Jumlah Dokumen", y="Kategori",
+                             orientation="h", color="Jumlah Dokumen", color_continuous_scale="Tealgrn",
+                             text="Jumlah Dokumen", title="Frekuensi Pendekatan/Metode")
+            fig_tax.update_traces(textposition="outside")
+            style_publication_figure(fig_tax, height=430)
+            _slr_finalize(fig_tax)
+            st.plotly_chart(fig_tax, use_container_width=True, config=SLR_PLOT_CONFIG)
+        with t2:
+            st.dataframe(tax_df, use_container_width=True, hide_index=True, height=430)
+            st.download_button("⬇️ Unduh taksonomi metode (CSV)", tax_df.to_csv(index=False).encode("utf-8"),
+                               "taksonomi_metode.csv", "text/csv")
+        st.divider()
+        st.markdown("#### Tantangan & Celah Penelitian")
+        ch_df = _slr_taxonomy_counts(analysis, SLR_CHALLENGES)
+        ch_df = ch_df.rename(columns={"Kategori": "Tantangan"})
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            fig_ch = px.bar(ch_df.sort_values("Jumlah Dokumen"), x="Jumlah Dokumen", y="Tantangan",
+                            orientation="h", color="Jumlah Dokumen", color_continuous_scale="OrRd",
+                            text="Jumlah Dokumen", title="Perhatian terhadap Tiap Tantangan")
+            fig_ch.update_traces(textposition="outside")
+            style_publication_figure(fig_ch, height=400)
+            _slr_finalize(fig_ch)
+            st.plotly_chart(fig_ch, use_container_width=True, config=SLR_PLOT_CONFIG)
+        with c2:
+            st.dataframe(ch_df, use_container_width=True, hide_index=True, height=400)
+            gaps = ch_df.sort_values("Jumlah Dokumen").head(2)["Tantangan"].tolist()
+            st.markdown(
+                f"<div class='soft-card'><b>Celah paling menonjol:</b> {', '.join(gaps)} "
+                f"— tantangan ini paling jarang dibahas sehingga berpotensi menjadi agenda riset mendatang "
+                f"pada perpotongan SNA–Knowledge Graph.</div>", unsafe_allow_html=True)
+        st.caption("Menjawab RQ4: peta pendekatan berulang, tantangan utama, dan celah/agenda penelitian ke depan.")
+
+    # ---------------- HASIL & PEMBAHASAN (narasi otomatis) ----------------
+    with tab_report:
+        st.markdown("#### 📝 Draf Otomatis: Hasil dan Pembahasan")
+        st.caption("Teks berikut dirakit otomatis dari angka hasil analisis (basis: studi terpilih setelah PRISMA). "
+                   "Salin ke naskah lalu sunting seperlunya. Angka diperbarui mengikuti data & filter yang aktif.")
+        report_md = _slr_build_report(analysis, counts, per_db, SLR_TAXONOMY, SLR_CHALLENGES,
+                                      apply_filter, min_au, max_nodes)
+        st.markdown(report_md)
+        st.download_button("⬇️ Unduh bagian Hasil & Pembahasan (.md)",
+                           report_md.encode("utf-8"), "hasil_dan_pembahasan.md", "text/markdown",
+                           use_container_width=True)
 
     # ---------------- DATA & DOWNLOAD ----------------
     with tab_data:

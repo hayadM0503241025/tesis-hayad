@@ -9726,7 +9726,9 @@ def _slr_extract_countries(raw):
         if not seg:
             continue
         hit = None
-        for token in reversed([c.strip() for c in seg.split(",")]):
+        # Bersihkan tanda kurung/titik/spasi agar token spt "China)" atau
+        # "(Australia" (format afiliasi berkurung gaya Dimensions) tetap cocok.
+        for token in reversed([c.strip(" .;:()[]{}") for c in seg.split(",")]):
             if token in _SLR_COUNTRY_SET:
                 hit = token
                 break
@@ -9796,17 +9798,22 @@ def _slr_map_row(row, cols, db):
                 or _slr_split_keywords(g("Index Keywords"))
                 or _slr_split_keywords(g("Fields of Study", "Fields of Research (ANZSRC 2020)",
                                          "MeSH terms", "Mesh_Terms", "IEEE Terms")))
-    # Negara: pakai kolom khusus bila ada (Dimensions), jika tidak parse dari afiliasi
+    # Negara: pakai kolom khusus bila ada (Dimensions/Lens), jika tidak parse dari
+    # afiliasi. Untuk Dimensions, "Authors Affiliations" hanya berisi organisasi
+    # (tanpa negara); kolom "Authors (Raw Affiliation)" memuat alamat lengkap +
+    # negara, jadi diprioritaskan untuk ekstraksi negara.
     country_col = g("Country of standardized research organization", "Countries",
                     "Country of Research organization")
     if country_col:
         countries = _slr_split_country_list(country_col)
     else:
-        aff = g("Affiliations", "Author Affiliations", "Authors with affiliations",
-                "Authors Affiliations", "Research Organizations - standardized")
-        countries = _slr_extract_countries(_slr_clean_text(aff))
+        aff_for_country = g("Affiliations", "Author Affiliations", "Authors with affiliations",
+                            "Authors (Raw Affiliation)", "Authors Affiliations",
+                            "Research Organizations - standardized")
+        countries = _slr_extract_countries(_slr_clean_text(aff_for_country))
     aff = _slr_clean_text(g("Affiliations", "Author Affiliations", "Authors with affiliations",
-                            "Authors Affiliations", "Research Organizations - standardized"))
+                            "Authors (Raw Affiliation)", "Authors Affiliations",
+                            "Research Organizations - standardized"))
     return dict(
         DB=db, Title=title, Year=year, Cites=cites, DOI=doi, Abstract=abstract,
         SourceTitle=source_title, Authors=authors, Keywords=keywords,
@@ -10572,14 +10579,30 @@ def _slr_build_vosviewer_df(records):
     for i, r in enumerate(records):
         authors = [a for a in (r.get("Authors") or []) if a]
         keywords = [k for k in (r.get("Keywords") or []) if k]
-        aff = r.get("Affiliations") or ""
-        # "Authors with affiliations" gaya Scopus: "Nama, Afiliasi; Nama, Afiliasi"
-        if authors and aff:
-            awa = "; ".join(f"{a}, {aff}" for a in authors)
+        # Negara bersih (hasil parsing ternormalisasi) — dedup sambil jaga urutan.
+        countries, _seen = [], set()
+        for c in (r.get("Countries") or []):
+            c = _slr_clean_text(c)
+            if c and c not in _seen:
+                _seen.add(c)
+                countries.append(c)
+        # "Authors with affiliations" gaya Scopus: "Nama, Afiliasi; Nama, Afiliasi".
+        # Agar VOSviewer memetakan NEGARA dengan benar, tiap entri penulis diakhiri
+        # satu negara valid sebagai token terakhir. Bila rekaman tak punya negara
+        # dikenali (mis. data paten Lens tanpa afiliasi), cukup tulis nama penulis
+        # sehingga VOSviewer melewatinya pada analisis negara — tidak ada lagi node
+        # sampah seperti "university)" / "institute)" / "college".
+        if authors and countries:
+            awa = "; ".join(
+                f"{a}, {countries[idx] if idx < len(countries) else countries[-1]}"
+                for idx, a in enumerate(authors)
+            )
         elif authors:
             awa = "; ".join(authors)
         else:
             awa = ""
+        # Kolom Affiliations = daftar negara unik (siap untuk analisis country/negara).
+        aff = "; ".join(countries)
         rows.append({
             "Authors": "; ".join(authors),
             "Author(s) ID": "",

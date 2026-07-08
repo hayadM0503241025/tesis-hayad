@@ -9571,7 +9571,7 @@ def render_centrality_methods_page(
 # =========================================================
 # 2.9 MODUL ANALISIS SLR (SYSTEMATIC LITERATURE REVIEW)
 #     PRISMA 2020 + Bibliometrik gaya VOSviewer/Biblioshiny
-#     Sumber data: folder ./slr (CSV ekspor Scopus/WoS/IEEE/Google Scholar)
+#     Sumber data: folder ./slr (CSV ekspor Scopus/IEEE/Dimensions/Lens/WoS/Google Scholar)
 # =========================================================
 import glob as _glob
 import itertools as _itertools
@@ -10596,7 +10596,7 @@ def _slr_build_vosviewer_df(records):
 def render_slr_analysis_page():
     st.markdown("<h1 class='main-header'>Analisis SLR — PRISMA 2020 & Bibliometrik</h1>", unsafe_allow_html=True)
     st.caption(
-        "Basis data diambil otomatis dari folder `slr/` (ekspor CSV Scopus, IEEE Xplore, Google Scholar/Publish or Perish). "
+        "Basis data diambil otomatis dari folder `slr/` (ekspor CSV Scopus, IEEE Xplore, Dimensions, Lens, serta Web of Science/Google Scholar bila tersedia). "
         "Alur mengikuti panduan PRISMA 2020 (Identification ▸ Screening ▸ Eligibility ▸ Included) "
         "dan pemetaan sains gaya VOSviewer/Biblioshiny — semuanya dijalankan native di Streamlit."
     )
@@ -10607,7 +10607,7 @@ def render_slr_analysis_page():
         up_files = st.file_uploader(
             "Tambah berkas ekspor SLR (CSV)", type=["csv"], accept_multiple_files=True,
             key="slr_new_data",
-            help="Unggah CSV ekspor baru (Scopus/IEEE/WoS/Google Scholar). "
+            help="Unggah CSV ekspor baru (Scopus/IEEE/Dimensions/Lens/WoS/Google Scholar). "
                  "Data akan digabung otomatis dengan folder slr/ lalu dideduplikasi.")
     if up_files:
         rec_up, per_up = slr_load_uploaded(up_files)
@@ -10716,7 +10716,7 @@ def render_slr_analysis_page():
                 "untuk mengisi diagram PRISMA 2020 pada naskah.</div>", unsafe_allow_html=True)
         with st.expander("Pemetaan langkah panduan ↔ fitur dashboard"):
             st.markdown(
-                "- **Gabung Scopus + WoS/IEEE + Scholar** → dilakukan otomatis saat memuat semua CSV di `slr/`.\n"
+                "- **Gabung Scopus + IEEE + Dimensions + Lens (+ WoS/Scholar)** → dilakukan otomatis saat memuat semua CSV di `slr/`.\n"
                 "- **Hapus duplikat (DOI/judul)** → deduplikasi otomatis (`duplicatedMatching`-style).\n"
                 "- **Saring judul & abstrak (inklusi/eksklusi)** → filter kata kunci + rentang tahun di sidebar.\n"
                 "- **Nilai kelayakan teks lengkap** → syarat abstrak/metadata pada fase Eligibility.\n"

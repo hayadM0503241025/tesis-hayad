@@ -10890,12 +10890,23 @@ def _slr_lotka(records):
 
 
 def _slr_country_collab(records, top=20):
-    """SCP/MCP & total sitasi per negara (negara utama = negara pertama dokumen)."""
+    """SCP/MCP & total sitasi per negara (negara utama = negara pertama dokumen).
+
+    Kolom 'Artikel/SCP/MCP' memakai NEGARA UTAMA (1 negara per dokumen, tanpa
+    dobel hitung) — setara 'Corresponding Author's Countries' bibliometrix.
+    Kolom 'Kemunculan (semua afiliasi)' = jumlah dokumen yang menyebut negara
+    itu DI MANA PUN (bisa dobel antar-negara) — inilah angka yang dipakai peta
+    'Produksi per Negara' di tab RQ3. Ditampilkan berdampingan agar perbedaan
+    kedua metode langsung terlihat dan bisa direkonsiliasi.
+    """
     by_cty = _defaultdict(lambda: {"articles": 0, "scp": 0, "mcp": 0, "cites": 0})
+    appear = _defaultdict(int)   # kemunculan (semua afiliasi) — gaya RQ3
     for r in records:
         ctys = list(dict.fromkeys(c for c in r["Countries"] if c))
         if not ctys:
             continue
+        for c in ctys:
+            appear[c] += 1
         primary = ctys[0]
         d = by_cty[primary]
         d["articles"] += 1
@@ -10908,17 +10919,18 @@ def _slr_country_collab(records, top=20):
     for cty, d in by_cty.items():
         rows.append({
             "Negara": cty,
-            "Artikel": d["articles"],
+            "Artikel (negara utama)": d["articles"],
             "SCP": d["scp"],
             "MCP": d["mcp"],
             "Rasio MCP": round(d["mcp"] / d["articles"], 3) if d["articles"] else 0,
             "Total Sitasi": d["cites"],
             "Rerata Sitasi": round(d["cites"] / d["articles"], 1) if d["articles"] else 0,
+            "Kemunculan (semua afiliasi)": appear.get(cty, d["articles"]),
         })
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    return df.sort_values("Artikel", ascending=False).head(top).reset_index(drop=True)
+    return df.sort_values("Artikel (negara utama)", ascending=False).head(top).reset_index(drop=True)
 
 
 def render_slr_bibliometrix_plus(analysis):
@@ -10942,7 +10954,10 @@ def render_slr_bibliometrix_plus(analysis):
     st.markdown("---")
     st.markdown("#### 👤 Dampak Penulis — h-index, g-index, m-index & fraksional")
     st.caption("h-index = jumlah h artikel dengan minimal h sitasi. m-index = h dibagi lama karier. "
-               "Fraksional = kontribusi penulis dibagi jumlah ko-penulis per artikel.")
+               "Fraksional = kontribusi penulis dibagi jumlah ko-penulis per artikel. "
+               "**Tabel ini diurutkan berdasarkan h-index (dampak)**, bukan jumlah dokumen. "
+               "Kolom 'Dokumen' identik dengan angka 'penulis paling produktif' di tab RQ1 — "
+               "yang berbeda hanya kriteria pengurutannya (dampak vs produktivitas).")
     ai = _slr_author_impact(analysis, ref_year, top=20)
     if ai.empty:
         st.info("Data penulis belum cukup untuk menghitung indeks dampak.")
@@ -11046,9 +11061,15 @@ def render_slr_bibliometrix_plus(analysis):
     # 7. Kolaborasi antarnegara (SCP/MCP).
     st.markdown("---")
     st.markdown("#### 🌍 Kolaborasi & Sitasi per Negara (SCP/MCP)")
-    st.caption("SCP = Single Country Publications (satu negara). "
-               "MCP = Multiple Country Publications (kolaborasi antarnegara). "
-               "Negara utama diambil dari negara pertama tiap dokumen (aproksimasi corresponding author).")
+    st.caption(
+        "SCP = Single Country Publications (satu negara). MCP = Multiple Country "
+        "Publications (kolaborasi antarnegara). **Artikel (negara utama)** = 1 dokumen "
+        "dihitung untuk SATU negara saja (negara pertama, proksi corresponding author) — "
+        "jumlah semua negara = jumlah dokumen. Bandingkan dengan **Kemunculan (semua "
+        "afiliasi)**: dokumen dihitung untuk SETIAP negara yang muncul — inilah angka "
+        "pada peta *Produksi per Negara* di tab RQ3 (bisa lebih besar karena dobel hitung). "
+        "Untuk laporan kolaborasi pakai kolom negara-utama; untuk keterlibatan/produksi pakai kolom kemunculan."
+    )
     cc = _slr_country_collab(analysis, top=20)
     if cc.empty:
         st.info("Data negara belum tersedia pada rekaman ini.")
@@ -11405,6 +11426,13 @@ def render_slr_analysis_page():
                                    "slr_author_nodes.csv", "text/csv")
         st.divider()
         st.markdown("#### Kolaborasi Antarnegara (Peta Dunia)")
+        st.caption(
+            "**Metode hitung: kemunculan (semua afiliasi)** — satu dokumen dihitung untuk "
+            "SETIAP negara yang muncul, sehingga total antar-negara bisa melebihi jumlah "
+            "dokumen. Ini berbeda dengan tabel SCP/MCP di tab *Metrik Bibliometrik+* yang "
+            "memakai satu negara utama per dokumen. Gunakan angka di sini untuk *produksi/"
+            "keterlibatan* negara, dan angka SCP/MCP untuk *kolaborasi*."
+        )
         cty_cnt, _ = _slr_counter(analysis, "Countries")
         intl_pairs = 0
         cdf = pd.DataFrame(columns=["Negara", "Dokumen"])

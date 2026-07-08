@@ -17,9 +17,36 @@
 # ---------------------------------------------------------------------
 # 0. Konfigurasi & paket
 # ---------------------------------------------------------------------
-# Set working directory ke lokasi script ini bila dijalankan interaktif.
-# (Kalau di-Source lewat RStudio hal ini otomatis; baris di bawah aman diabaikan.)
 options(stringsAsFactors = FALSE)
+
+# Pindahkan working directory ke FOLDER TEMPAT SCRIPT INI berada, apa pun cara
+# menjalankannya (tombol Source RStudio, source(), atau Rscript). Dengan begini
+# file CSV yang diletakkan di folder yang sama otomatis ketemu — Anda tidak perlu
+# setwd() manual atau lewat menu Session.
+cari_folder_skrip <- function() {
+  # a) Rscript ... analisis_slr.R  →  argumen --file=
+  args <- commandArgs(trailingOnly = FALSE)
+  m <- grep("^--file=", args, value = TRUE)
+  if (length(m) > 0) return(dirname(normalizePath(sub("^--file=", "", m[1]))))
+  # b) source("analisis_slr.R")  →  variabel ofile pada frame pemanggil
+  for (i in seq_len(sys.nframe())) {
+    of <- tryCatch(get("ofile", envir = sys.frame(i)), error = function(e) NULL)
+    if (!is.null(of)) return(dirname(normalizePath(of)))
+  }
+  # c) tombol "Source" / editor aktif di RStudio
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(p)) return(dirname(normalizePath(p)))
+  }
+  NA_character_
+}
+.folder_skrip <- tryCatch(cari_folder_skrip(), error = function(e) NA_character_)
+if (!is.na(.folder_skrip) && dir.exists(.folder_skrip)) {
+  setwd(.folder_skrip)
+  message("Working directory diset otomatis ke: ", .folder_skrip)
+} else {
+  message("Catatan: working directory tidak diubah (", getwd(), ").")
+}
 
 pasang_jika_perlu <- function(paket) {
   for (p in paket) {
@@ -73,8 +100,13 @@ if (file.exists("vosviewer_scopus.csv")) {
     judul    = "Judul"
   )
 } else {
-  stop("File data tidak ditemukan. Letakkan 'vosviewer_scopus.csv' atau ",
-       "'slr_included.csv' di folder yang sama dengan script ini.")
+  stop("File data tidak ditemukan di working directory saat ini:\n  ", getwd(),
+       "\n\nSolusi: letakkan 'vosviewer_scopus.csv' (atau 'slr_included.csv') di ",
+       "folder yang SAMA dengan script ini, lalu jalankan lagi.\n",
+       "Bila file ada di folder lain, arahkan dulu dengan:\n",
+       "  setwd(\"C:/path/ke/folder/berisi/csv\")\n",
+       "atau menu RStudio: Session > Set Working Directory > To Source File Location.",
+       call. = FALSE)
 }
 
 # Helper: ambil kolom dengan aman (kembalikan vektor kosong bila tak ada).

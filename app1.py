@@ -10655,6 +10655,419 @@ def _slr_build_vosviewer_df(records):
     return pd.DataFrame(rows, columns=cols)
 
 
+# =========================================================
+#  METRIK BIBLIOMETRIK LANJUTAN (setara output bibliometrix R)
+#  Semua dihitung dari data kita: Authors, Year, Cites, SourceTitle,
+#  Countries, Keywords. Tidak butuh daftar referensi.
+# =========================================================
+def _slr_hindex(cites):
+    """h-index: jumlah h dokumen yang masing-masing disitasi >= h kali."""
+    c = sorted((int(x or 0) for x in cites), reverse=True)
+    h = 0
+    for i, v in enumerate(c, 1):
+        if v >= i:
+            h = i
+        else:
+            break
+    return h
+
+
+def _slr_gindex(cites):
+    """g-index: g dokumen teratas yang total sitasinya >= g^2."""
+    c = sorted((int(x or 0) for x in cites), reverse=True)
+    cum, g = 0, 0
+    for i, v in enumerate(c, 1):
+        cum += v
+        if cum >= i * i:
+            g = i
+        else:
+            break
+    return g
+
+
+def _slr_ref_year(records):
+    """Tahun acuan untuk umur dokumen & TCperYear (tahun publikasi terbaru)."""
+    years = [r["Year"] for r in records if r["Year"]]
+    return max(years) if years else None
+
+
+def _slr_main_info_plus(records, ref_year):
+    """Metrik 'Main Information' gaya bibliometrix yang belum ada di RQ1."""
+    years = [r["Year"] for r in records if r["Year"]]
+    cites = [r["Cites"] or 0 for r in records]
+    # Umur dokumen rata-rata.
+    ages = [ref_year - r["Year"] for r in records if r["Year"] and ref_year is not None]
+    doc_avg_age = np.mean(ages) if ages else None
+    # Sitasi per tahun per dokumen.
+    cpy = [
+        (r["Cites"] or 0) / max(1, (ref_year - r["Year"] + 1))
+        for r in records if r["Year"] and ref_year is not None
+    ]
+    # Penulis & kolaborasi.
+    appearances = 0
+    author_docs = _defaultdict(int)
+    single_docs = 0
+    single_authors = set()
+    intl_docs = 0
+    for r in records:
+        keys = [_slr_author_key(a) for a in r["Authors"] if _slr_author_key(a)]
+        keys_unique = list(dict.fromkeys(keys))
+        appearances += len(keys_unique)
+        for k in keys_unique:
+            author_docs[k] += 1
+        if len(keys_unique) == 1:
+            single_docs += 1
+            single_authors.add(keys_unique[0])
+        if len({c for c in r["Countries"] if c}) > 1:
+            intl_docs += 1
+    n_authors = len(author_docs)
+    n = len(records)
+    coauthors_per_doc = np.mean([
+        len({_slr_author_key(a) for a in r["Authors"] if _slr_author_key(a)}) for r in records
+    ]) if records else 0
+    multi_docs = sum(
+        1 for r in records
+        if len({_slr_author_key(a) for a in r["Authors"] if _slr_author_key(a)}) > 1
+    )
+    collab_index = (
+        appearances / multi_docs if multi_docs else 0
+    )  # Collaboration Index = penulis dok. multi-penulis / jumlah dok. multi-penulis
+    intl_pct = (intl_docs / n * 100) if n else 0
+    docs_per_author = (n / n_authors) if n_authors else 0
+
+    def fmt(x, d=2):
+        return f"{x:.{d}f}" if x is not None else "-"
+
+    rows = [
+        ("Umur dokumen rata-rata (tahun)", fmt(doc_avg_age)),
+        ("Rerata sitasi per tahun per dokumen", fmt(np.mean(cpy) if cpy else None)),
+        ("Kemunculan penulis (author appearances)", f"{appearances}"),
+        ("Penulis dokumen tunggal", f"{len(single_authors)}"),
+        ("Dokumen penulis tunggal", f"{single_docs}"),
+        ("Dokumen per penulis", fmt(docs_per_author, 3)),
+        ("Ko-penulis per dokumen", fmt(coauthors_per_doc)),
+        ("Indeks kolaborasi (CI)", fmt(collab_index)),
+        ("Ko-penulisan internasional %", fmt(intl_pct, 2)),
+    ]
+    return pd.DataFrame(rows, columns=["Metrik (lanjutan)", "Nilai"])
+
+
+def _slr_author_impact(records, ref_year, top=20):
+    """h/g/m-index, fractionalized authorship, dan produktivitas per penulis."""
+    by_author = _defaultdict(lambda: {"cites": [], "years": [], "docs": 0, "frac": 0.0})
+    disp = {}
+    for r in records:
+        keys = list(dict.fromkeys(
+            _slr_author_key(a) for a in r["Authors"] if _slr_author_key(a)
+        ))
+        n_au = len(keys)
+        for a in r["Authors"]:
+            k = _slr_author_key(a)
+            if k:
+                disp.setdefault(k, a)
+        for k in keys:
+            d = by_author[k]
+            d["cites"].append(r["Cites"] or 0)
+            if r["Year"]:
+                d["years"].append(r["Year"])
+            d["docs"] += 1
+            d["frac"] += 1.0 / n_au if n_au else 0.0
+    rows = []
+    for k, d in by_author.items():
+        h = _slr_hindex(d["cites"])
+        first_year = min(d["years"]) if d["years"] else None
+        span = (ref_year - first_year + 1) if (first_year and ref_year) else None
+        m = (h / span) if span else None
+        rows.append({
+            "Penulis": disp.get(k, k),
+            "Dokumen": d["docs"],
+            "Fraksional": round(d["frac"], 2),
+            "Total Sitasi": int(sum(d["cites"])),
+            "h-index": h,
+            "g-index": _slr_gindex(d["cites"]),
+            "m-index": round(m, 2) if m is not None else None,
+            "Mulai Terbit": first_year,
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values(["h-index", "Total Sitasi"], ascending=False).head(top).reset_index(drop=True)
+
+
+def _slr_source_impact(records, top=20):
+    """h-index & sitasi per sumber (jurnal/prosiding)."""
+    by_src = _defaultdict(lambda: {"cites": [], "docs": 0})
+    for r in records:
+        s = (r["SourceTitle"] or "").strip()
+        if not s:
+            continue
+        by_src[s]["cites"].append(r["Cites"] or 0)
+        by_src[s]["docs"] += 1
+    rows = [{
+        "Sumber": s,
+        "Dokumen": d["docs"],
+        "Total Sitasi": int(sum(d["cites"])),
+        "h-index": _slr_hindex(d["cites"]),
+    } for s, d in by_src.items()]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values(["h-index", "Dokumen"], ascending=False).head(top).reset_index(drop=True)
+
+
+def _slr_top_docs_normalized(records, ref_year, top=20):
+    """Dokumen paling berdampak dengan TC, TCperYear, dan NTC (ternormalisasi tahun)."""
+    year_mean = {}
+    by_year = _defaultdict(list)
+    for r in records:
+        if r["Year"]:
+            by_year[r["Year"]].append(r["Cites"] or 0)
+    for y, cs in by_year.items():
+        year_mean[y] = np.mean(cs) if cs else 0
+    rows = []
+    for r in records:
+        tc = r["Cites"] or 0
+        y = r["Year"]
+        tcpy = tc / max(1, (ref_year - y + 1)) if (y and ref_year) else None
+        base = year_mean.get(y, 0)
+        ntc = (tc / base) if base else None
+        rows.append({
+            "Dokumen": (r["Title"][:70] + "…") if len(r["Title"]) > 70 else r["Title"],
+            "Tahun": y,
+            "TC": tc,
+            "TCperYear": round(tcpy, 1) if tcpy is not None else None,
+            "NTC": round(ntc, 2) if ntc is not None else None,
+            "DOI": r["DOI"],
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("TC", ascending=False).head(top).reset_index(drop=True)
+
+
+def _slr_bradford(records):
+    """Hukum Bradford: bagi sumber ke 3 zona dengan jumlah artikel ~sama."""
+    src_cnt, _ = _slr_counter(records, "SourceTitle")
+    ranked = src_cnt.most_common()
+    total = sum(v for _, v in ranked)
+    if total == 0:
+        return pd.DataFrame(), pd.DataFrame()
+    third = total / 3.0
+    rows, cum, zone = [], 0, 1
+    for rank, (name, n) in enumerate(ranked, 1):
+        cum += n
+        rows.append({"Peringkat": rank, "Sumber": name, "Artikel": n,
+                     "Kumulatif": cum, "Zona": zone})
+        if zone < 3 and cum >= zone * third:
+            zone += 1
+    df = pd.DataFrame(rows)
+    zona_summary = df.groupby("Zona").agg(
+        Sumber=("Sumber", "count"), Artikel=("Artikel", "sum")
+    ).reset_index()
+    return df, zona_summary
+
+
+def _slr_lotka(records):
+    """Hukum Lotka: distribusi penulis menurut jumlah publikasi (observasi vs teori)."""
+    au_cnt, _ = _slr_counter(records, "Authors")
+    prod = _Counter(au_cnt.values())  # jumlah_publikasi -> jumlah_penulis
+    total_authors = sum(prod.values())
+    if total_authors == 0:
+        return pd.DataFrame()
+    c1 = prod.get(1, 0) / total_authors  # proporsi penulis dengan 1 artikel
+    rows = []
+    for n_pub in sorted(prod):
+        n_au = prod[n_pub]
+        obs = n_au / total_authors
+        teori = c1 / (n_pub ** 2)  # Lotka: f(n) = C / n^2
+        rows.append({
+            "Artikel Ditulis": n_pub,
+            "Jumlah Penulis": n_au,
+            "Proporsi Observasi": round(obs, 4),
+            "Proporsi Teori (Lotka)": round(teori, 4),
+        })
+    return pd.DataFrame(rows)
+
+
+def _slr_country_collab(records, top=20):
+    """SCP/MCP & total sitasi per negara (negara utama = negara pertama dokumen)."""
+    by_cty = _defaultdict(lambda: {"articles": 0, "scp": 0, "mcp": 0, "cites": 0})
+    for r in records:
+        ctys = list(dict.fromkeys(c for c in r["Countries"] if c))
+        if not ctys:
+            continue
+        primary = ctys[0]
+        d = by_cty[primary]
+        d["articles"] += 1
+        d["cites"] += (r["Cites"] or 0)
+        if len(ctys) > 1:
+            d["mcp"] += 1
+        else:
+            d["scp"] += 1
+    rows = []
+    for cty, d in by_cty.items():
+        rows.append({
+            "Negara": cty,
+            "Artikel": d["articles"],
+            "SCP": d["scp"],
+            "MCP": d["mcp"],
+            "Rasio MCP": round(d["mcp"] / d["articles"], 3) if d["articles"] else 0,
+            "Total Sitasi": d["cites"],
+            "Rerata Sitasi": round(d["cites"] / d["articles"], 1) if d["articles"] else 0,
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("Artikel", ascending=False).head(top).reset_index(drop=True)
+
+
+def render_slr_bibliometrix_plus(analysis):
+    """Tab metrik bibliometrik lanjutan — setara output bibliometrix R."""
+    ref_year = _slr_ref_year(analysis)
+    st.caption(
+        "Analisis tambahan yang setara output **bibliometrix (R)** dan dihitung "
+        "langsung dari data kita (tanpa perlu daftar referensi). Tahun acuan: "
+        f"**{ref_year if ref_year else '-'}**."
+    )
+
+    # 1. Metrik utama lanjutan.
+    st.markdown("#### 📇 Informasi Utama (metrik lanjutan)")
+    mi = _slr_main_info_plus(analysis, ref_year)
+    st.dataframe(mi, use_container_width=True, hide_index=True)
+    st.download_button("⬇️ Unduh metrik lanjutan (CSV)",
+                       mi.to_csv(index=False).encode("utf-8"),
+                       "metrik_lanjutan.csv", "text/csv", key="bx_main_dl")
+
+    # 2. Dampak penulis (h/g/m-index + fraksional).
+    st.markdown("---")
+    st.markdown("#### 👤 Dampak Penulis — h-index, g-index, m-index & fraksional")
+    st.caption("h-index = jumlah h artikel dengan minimal h sitasi. m-index = h dibagi lama karier. "
+               "Fraksional = kontribusi penulis dibagi jumlah ko-penulis per artikel.")
+    ai = _slr_author_impact(analysis, ref_year, top=20)
+    if ai.empty:
+        st.info("Data penulis belum cukup untuk menghitung indeks dampak.")
+    else:
+        st.dataframe(ai, use_container_width=True, hide_index=True, height=430)
+        fig_h = px.bar(ai.head(15).sort_values("h-index"), x="h-index", y="Penulis",
+                       orientation="h", color="h-index", color_continuous_scale="Purples",
+                       title="15 Penulis dengan h-index Tertinggi", text="h-index")
+        fig_h.update_traces(textposition="outside")
+        style_publication_figure(fig_h, height=470)
+        _slr_finalize(fig_h)
+        st.plotly_chart(fig_h, use_container_width=True, config=SLR_PLOT_CONFIG)
+        st.download_button("⬇️ Unduh dampak penulis (CSV)",
+                           ai.to_csv(index=False).encode("utf-8"),
+                           "dampak_penulis.csv", "text/csv", key="bx_author_dl")
+
+    # 3. Dampak sumber.
+    st.markdown("---")
+    st.markdown("#### 📚 Dampak Sumber — h-index per jurnal/prosiding")
+    si = _slr_source_impact(analysis, top=20)
+    if si.empty:
+        st.info("Data sumber belum cukup.")
+    else:
+        st.dataframe(si, use_container_width=True, hide_index=True, height=430)
+        st.download_button("⬇️ Unduh dampak sumber (CSV)",
+                           si.to_csv(index=False).encode("utf-8"),
+                           "dampak_sumber.csv", "text/csv", key="bx_source_dl")
+
+    # 4. Dokumen ternormalisasi (TC/TCperYear/NTC).
+    st.markdown("---")
+    st.markdown("#### 📄 Dokumen Paling Berdampak — TC, TCperYear & NTC")
+    st.caption("TC = total sitasi. TCperYear = sitasi per tahun. "
+               "NTC = sitasi ternormalisasi (dibagi rerata sitasi dokumen setahun terbit).")
+    nd = _slr_top_docs_normalized(analysis, ref_year, top=20)
+    if nd.empty:
+        st.info("Data dokumen belum cukup.")
+    else:
+        st.dataframe(nd, use_container_width=True, hide_index=True, height=430)
+        st.download_button("⬇️ Unduh dokumen ternormalisasi (CSV)",
+                           nd.to_csv(index=False).encode("utf-8"),
+                           "dokumen_ternormalisasi.csv", "text/csv", key="bx_doc_dl")
+
+    # 5. Hukum Bradford.
+    st.markdown("---")
+    st.markdown("#### 🗂️ Hukum Bradford — Zona Sumber Inti")
+    st.caption("Sumber dibagi 3 zona dengan jumlah artikel hampir sama. "
+               "**Zona 1 = sumber inti** (paling sedikit judul, tapi memuat sepertiga artikel).")
+    bdf, bz = _slr_bradford(analysis)
+    if bdf.empty:
+        st.info("Data sumber belum cukup untuk analisis Bradford.")
+    else:
+        cbz1, cbz2 = st.columns([2, 3])
+        with cbz1:
+            bz2 = bz.copy()
+            bz2["Zona"] = bz2["Zona"].map({1: "Zona 1 (inti)", 2: "Zona 2", 3: "Zona 3"})
+            st.dataframe(bz2, use_container_width=True, hide_index=True)
+        with cbz2:
+            fig_b = px.bar(bz.assign(ZonaLbl=bz["Zona"].map({1: "Zona 1 (inti)", 2: "Zona 2", 3: "Zona 3"})),
+                           x="ZonaLbl", y="Sumber", color="Artikel",
+                           color_continuous_scale="Oranges", text="Sumber",
+                           title="Jumlah Sumber per Zona Bradford")
+            fig_b.update_traces(textposition="outside")
+            style_publication_figure(fig_b, height=320, xaxis_title="Zona", yaxis_title="Jumlah Sumber")
+            _slr_finalize(fig_b)
+            st.plotly_chart(fig_b, use_container_width=True, config=SLR_PLOT_CONFIG)
+        st.markdown("**Sumber inti (Zona 1)**")
+        core = bdf[bdf["Zona"] == 1][["Peringkat", "Sumber", "Artikel", "Kumulatif"]]
+        st.dataframe(core, use_container_width=True, hide_index=True, height=320)
+        st.download_button("⬇️ Unduh tabel Bradford (CSV)",
+                           bdf.to_csv(index=False).encode("utf-8"),
+                           "bradford.csv", "text/csv", key="bx_bradford_dl")
+
+    # 6. Hukum Lotka.
+    st.markdown("---")
+    st.markdown("#### ✍️ Hukum Lotka — Produktivitas Penulis")
+    st.caption("Distribusi jumlah penulis menurut banyak artikel yang ditulis, "
+               "dibandingkan prediksi teoretis Lotka f(n) = C/n².")
+    ldf = _slr_lotka(analysis)
+    if ldf.empty:
+        st.info("Data penulis belum cukup untuk analisis Lotka.")
+    else:
+        cl1, cl2 = st.columns([2, 3])
+        with cl1:
+            st.dataframe(ldf, use_container_width=True, hide_index=True, height=340)
+        with cl2:
+            fig_l = go.Figure()
+            fig_l.add_trace(go.Bar(x=ldf["Artikel Ditulis"], y=ldf["Proporsi Observasi"],
+                                   name="Observasi", marker_color="#2563EB"))
+            fig_l.add_trace(go.Scatter(x=ldf["Artikel Ditulis"], y=ldf["Proporsi Teori (Lotka)"],
+                                       name="Teori Lotka", mode="lines+markers",
+                                       line=dict(color="#DC2626", width=3)))
+            fig_l.update_layout(title="Distribusi Produktivitas Penulis (Lotka)",
+                                xaxis_title="Jumlah artikel ditulis", yaxis_title="Proporsi penulis")
+            style_publication_figure(fig_l, height=340)
+            _slr_finalize(fig_l, legend_bottom=True)
+            st.plotly_chart(fig_l, use_container_width=True, config=SLR_PLOT_CONFIG)
+        st.download_button("⬇️ Unduh tabel Lotka (CSV)",
+                           ldf.to_csv(index=False).encode("utf-8"),
+                           "lotka.csv", "text/csv", key="bx_lotka_dl")
+
+    # 7. Kolaborasi antarnegara (SCP/MCP).
+    st.markdown("---")
+    st.markdown("#### 🌍 Kolaborasi & Sitasi per Negara (SCP/MCP)")
+    st.caption("SCP = Single Country Publications (satu negara). "
+               "MCP = Multiple Country Publications (kolaborasi antarnegara). "
+               "Negara utama diambil dari negara pertama tiap dokumen (aproksimasi corresponding author).")
+    cc = _slr_country_collab(analysis, top=20)
+    if cc.empty:
+        st.info("Data negara belum tersedia pada rekaman ini.")
+    else:
+        st.dataframe(cc, use_container_width=True, hide_index=True, height=430)
+        top_cc = cc.head(12)
+        fig_c = go.Figure()
+        fig_c.add_trace(go.Bar(x=top_cc["Negara"], y=top_cc["SCP"], name="SCP", marker_color="#2563EB"))
+        fig_c.add_trace(go.Bar(x=top_cc["Negara"], y=top_cc["MCP"], name="MCP", marker_color="#F59E0B"))
+        fig_c.update_layout(barmode="stack", title="SCP vs MCP per Negara (12 teratas)",
+                            xaxis_title="Negara", yaxis_title="Jumlah dokumen")
+        style_publication_figure(fig_c, height=420)
+        _slr_finalize(fig_c, legend_bottom=True)
+        st.plotly_chart(fig_c, use_container_width=True, config=SLR_PLOT_CONFIG)
+        st.download_button("⬇️ Unduh kolaborasi negara (CSV)",
+                           cc.to_csv(index=False).encode("utf-8"),
+                           "kolaborasi_negara.csv", "text/csv", key="bx_country_dl")
+
+
 def render_slr_analysis_page():
     st.markdown("<h1 class='main-header'>Analisis SLR — PRISMA 2020 & Bibliometrik</h1>", unsafe_allow_html=True)
     st.caption(
@@ -10744,10 +11157,11 @@ def render_slr_analysis_page():
     if not analysis:
         analysis = unique
 
-    tab_prisma, tab_over, tab_concept, tab_social, tab_tax, tab_report, tab_data = st.tabs(
+    (tab_prisma, tab_over, tab_concept, tab_social, tab_tax, tab_report,
+     tab_biblio, tab_data) = st.tabs(
         ["📋 PRISMA 2020", "📊 RQ1 Performa", "🧠 RQ2 Struktur Konseptual",
          "🌐 RQ3 Struktur Sosial & Intelektual", "🧩 RQ4 Taksonomi & Celah",
-         "📝 Hasil & Pembahasan", "🗂️ Data & Unduh"])
+         "📝 Hasil & Pembahasan", "📈 Metrik Bibliometrik+", "🗂️ Data & Unduh"])
 
     # ---------------- PRISMA ----------------
     with tab_prisma:
@@ -11101,6 +11515,11 @@ def render_slr_analysis_page():
         st.download_button("⬇️ Unduh bagian Hasil & Pembahasan (.md)",
                            report_md.encode("utf-8"), "hasil_dan_pembahasan.md", "text/markdown",
                            use_container_width=True)
+
+    # ---------------- BIBLIOMETRIX+ ----------------
+    with tab_biblio:
+        st.markdown("### 📈 Metrik Bibliometrik Lanjutan (setara bibliometrix R)")
+        render_slr_bibliometrix_plus(analysis)
 
     # ---------------- DATA & DOWNLOAD ----------------
     with tab_data:

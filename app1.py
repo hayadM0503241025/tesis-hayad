@@ -9814,21 +9814,50 @@ def _slr_map_row(row, cols, db):
     )
 
 
-@st.cache_data(show_spinner=False)
-def slr_load_raw(data_dir=SLR_DATA_DIR):
-    records, per_db = [], _Counter()
-    for f in sorted(_glob.glob(os.path.join(data_dir, "*.csv"))):
+def _slr_read_bibliographic_csv(src, is_upload=False):
+    """Baca satu CSV ekspor bibliografi dengan penanganan encoding sekaligus baris
+    *preamble*. Sebagian ekspor (mis. Dimensions) menaruh baris disclaimer/hak cipta
+    di atas header sebenarnya, sehingga header tergeser satu baris dan sumbernya gagal
+    terdeteksi (terbaca "Lainnya"). Fungsi mencoba beberapa offset baris dan memilih
+    yang menghasilkan sumber yang dikenali. Mengembalikan (DataFrame, nama_basis_data)
+    atau (None, "Lainnya") bila berkas tak terbaca sama sekali.
+    """
+    def _read(enc, skiprows):
+        if is_upload:
+            src.seek(0)
+        return pd.read_csv(src, encoding=enc, dtype=str, on_bad_lines="skip",
+                           skiprows=skiprows)
+
+    base_df = None
+    # skip=0 menangani Scopus/IEEE/Lens (header di baris pertama); skip=1..2
+    # menangani ekspor dengan baris preamble seperti Dimensions.
+    for skip in (0, 1, 2):
         df = None
         for enc in ("utf-8-sig", "latin-1"):
             try:
-                df = pd.read_csv(f, encoding=enc, dtype=str, on_bad_lines="skip")
+                df = _read(enc, skip)
                 break
             except Exception:
                 continue
         if df is None:
             continue
+        if base_df is None:
+            base_df = df  # simpan pembacaan tanpa lewati baris sebagai cadangan
+        if _slr_detect_source(list(df.columns)) != "Lainnya":
+            return df, _slr_detect_source(list(df.columns))
+    if base_df is None:
+        return None, "Lainnya"
+    return base_df, _slr_detect_source(list(base_df.columns))
+
+
+@st.cache_data(show_spinner=False)
+def slr_load_raw(data_dir=SLR_DATA_DIR):
+    records, per_db = [], _Counter()
+    for f in sorted(_glob.glob(os.path.join(data_dir, "*.csv"))):
+        df, db = _slr_read_bibliographic_csv(f, is_upload=False)
+        if df is None:
+            continue
         cols = list(df.columns)
-        db = _slr_detect_source(cols)
         for _, row in df.iterrows():
             rec = _slr_map_row(row, cols, db)
             if not rec["Title"]:
@@ -9843,18 +9872,10 @@ def slr_load_uploaded(files):
     """Baca berkas CSV yang diunggah pengguna (data baru) dengan skema yang sama."""
     records, per_db = [], _Counter()
     for f in files:
-        df = None
-        for enc in ("utf-8-sig", "latin-1"):
-            try:
-                f.seek(0)
-                df = pd.read_csv(f, encoding=enc, dtype=str, on_bad_lines="skip")
-                break
-            except Exception:
-                continue
+        df, db = _slr_read_bibliographic_csv(f, is_upload=True)
         if df is None:
             continue
         cols = list(df.columns)
-        db = _slr_detect_source(cols)
         for _, row in df.iterrows():
             rec = _slr_map_row(row, cols, db)
             if not rec["Title"]:

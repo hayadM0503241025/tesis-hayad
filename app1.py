@@ -9578,6 +9578,24 @@ import itertools as _itertools
 from collections import Counter as _Counter, defaultdict as _defaultdict
 
 SLR_DATA_DIR = "slr"
+SLR_R_SCRIPT_PATH = os.path.join(SLR_DATA_DIR, "analisis_slr.R")
+
+
+def _load_slr_r_script() -> str:
+    """Baca script R siap-pakai untuk analisis SLR di R (RStudio/VS Code).
+
+    Dibaca dari berkas `slr/analisis_slr.R` agar selalu sinkron dengan versi
+    di repo. Bila berkas tak ditemukan (mis. deployment terpangkas), kembalikan
+    pesan singkat sebagai isi berkas agar tombol unduh tetap berfungsi.
+    """
+    try:
+        with open(SLR_R_SCRIPT_PATH, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return (
+            "# Script analisis_slr.R tidak ditemukan pada server.\n"
+            "# Silakan ambil dari repositori proyek: slr/analisis_slr.R\n"
+        )
 
 # Palet klaster gaya VOSviewer (kontras tinggi, ramah publikasi hitam-putih)
 SLR_CLUSTER_COLORS = [
@@ -11127,6 +11145,38 @@ def render_slr_analysis_page():
             "Read data from bibliographic database files ▸ tab Scopus ▸ pilih file "
             "`vosviewer_scopus.csv` ini*. Lalu pilih jenis analisis (Co-authorship, "
             "Co-occurrence of author keywords, Citation, dll.)."
+        )
+
+        st.markdown("---")
+        st.markdown("#### 📊 Analisis lanjut di R (RStudio / VS Code)")
+        st.caption(
+            "R **tidak** berjalan di dalam aplikasi Streamlit ini (Streamlit = Python). "
+            "Alih-alih, unduh **data CSV** di atas + **script `.R`** di bawah, lalu jalankan "
+            "script-nya di **RStudio** atau **VS Code** (dengan extension R terpasang)."
+        )
+        rr1, rr2 = st.columns(2)
+        rr1.download_button(
+            "⬇️ Unduh script analisis R (.R)",
+            _load_slr_r_script().encode("utf-8"),
+            "analisis_slr.R", "text/plain", use_container_width=True,
+            key="slr_r_script_download",
+        )
+        rr2.download_button(
+            "⬇️ Unduh data untuk R (CSV, format Scopus)",
+            vos_df.to_csv(index=False).encode("utf-8"),
+            "vosviewer_scopus.csv", "text/csv", use_container_width=True,
+            key="slr_r_data_download",
+        )
+        st.markdown(
+            "**Langkah menjalankan di R:**\n"
+            "1. Taruh `analisis_slr.R` dan `vosviewer_scopus.csv` (atau `slr_included.csv`) "
+            "di **folder yang sama**.\n"
+            "2. Buka `analisis_slr.R` di **RStudio** (atau VS Code + extension *R*).\n"
+            "3. **Run/Source** seluruh script (di RStudio: `Ctrl+Shift+S`). Paket yang belum "
+            "ada akan ter-install otomatis (`igraph`, opsional `bibliometrix`).\n"
+            "4. Hasil (grafik `.png` + tabel `.csv`) muncul di folder **`hasil_slr/`**: tren "
+            "publikasi per tahun, sumber & kata kunci teratas, jaringan ko-kata-kunci dan "
+            "ko-penulis (Louvain + centrality), serta ringkasan `bibliometrix` bila tersedia."
         )
 
 

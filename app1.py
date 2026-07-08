@@ -9814,10 +9814,13 @@ def _slr_map_row(row, cols, db):
     aff = _slr_clean_text(g("Affiliations", "Author Affiliations", "Authors with affiliations",
                             "Authors (Raw Affiliation)", "Authors Affiliations",
                             "Research Organizations - standardized"))
+    # Daftar referensi (untuk co-citation). Umumnya hanya tersedia pada ekspor
+    # Scopus bila kolom "References" ikut dicentang saat mengekspor CSV.
+    references = _slr_split_references(g("References", "Cited references", "Cited References"))
     return dict(
         DB=db, Title=title, Year=year, Cites=cites, DOI=doi, Abstract=abstract,
         SourceTitle=source_title, Authors=authors, Keywords=keywords,
-        Affiliations=aff, Countries=countries,
+        Affiliations=aff, Countries=countries, References=references,
     )
 
 
@@ -10024,6 +10027,88 @@ def _slr_build_cooccurrence(records, field, min_occ, min_edge=1, max_nodes=80):
         if w >= min_edge:
             G.add_edge(a, b, weight=w)
     return G
+
+
+_SLR_REF_YEAR_RE = re.compile(r"\((\d{4})[a-z]?\)")
+
+
+def _slr_split_references(raw):
+    """Pisah kolom 'References' (gaya Scopus) menjadi daftar string referensi.
+    Scopus memisahkan antar-referensi dengan '; '. Potongan yang terlalu pendek
+    (bukan referensi utuh) dibuang.
+    """
+    raw = _slr_clean_text(raw)
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(";") if len(p.strip()) >= 8]
+
+
+def _slr_parse_reference_key(ref):
+    """Satu string referensi → (kunci, label, tahun). Kunci = 'penulis-pertama
+    tahun' sehingga referensi yang sama tergabung menjadi satu node co-citation.
+    Mengembalikan None bila tahun/penulis tak dapat diekstrak.
+    """
+    ref = _slr_clean_text(ref)
+    if len(ref) < 8:
+        return None
+    yrs = _SLR_REF_YEAR_RE.findall(ref)
+    if not yrs:
+        return None
+    year = int(yrs[-1])
+    head = ref.split(",")[0].strip()
+    head = re.sub(r"\b([A-Za-z]\.){1,4}", "", head).strip(" .,")  # buang inisial "A.B."
+    surname = re.sub(r"[^A-Za-z\- ]", "", head).strip()
+    if not surname:
+        toks = re.findall(r"[A-Za-z][A-Za-z\-]{1,}", ref)
+        surname = toks[0] if toks else ""
+    if not surname:
+        return None
+    surname = surname.split()[0].title()
+    return f"{surname.lower()} {year}", f"{surname} ({year})", year
+
+
+def _slr_build_cocitation(records, min_occ=3, min_edge=1, max_nodes=80):
+    """Jaringan co-citation: node = referensi (penulis pertama + tahun), edge =
+    frekuensi dua referensi dikutip bersama pada dokumen yang sama. Node memakai
+    atribut yang sama dengan jaringan lain (label/occ/avg_year/cites) agar dapat
+    dirender ulang oleh _slr_network_figure/_slr_node_table. Mengembalikan
+    (graph, jumlah_dokumen_dengan_referensi).
+    """
+    doc_refs, ref_occ = [], _Counter()
+    ref_label, ref_year = {}, {}
+    for r in records:
+        keys = set()
+        for ref in (r.get("References") or []):
+            parsed = _slr_parse_reference_key(ref)
+            if not parsed:
+                continue
+            k, lbl, yr = parsed
+            keys.add(k)
+            ref_label.setdefault(k, lbl)
+            ref_year.setdefault(k, yr)
+        if keys:
+            doc_refs.append(keys)
+            for k in keys:
+                ref_occ[k] += 1
+
+    kept = {k for k, n in ref_occ.items() if n >= min_occ}
+    if len(kept) > max_nodes:
+        kept = set(sorted(kept, key=lambda k: ref_occ[k], reverse=True)[:max_nodes])
+
+    G = nx.Graph()
+    for k in kept:
+        G.add_node(k, label=ref_label.get(k, k), occ=ref_occ[k],
+                   avg_year=(float(ref_year[k]) if k in ref_year else None),
+                   cites=ref_occ[k])
+    edge_w = _Counter()
+    for keys in doc_refs:
+        present = sorted(keys & kept)
+        for a, b in _itertools.combinations(present, 2):
+            edge_w[(a, b)] += 1
+    for (a, b), w in edge_w.items():
+        if w >= min_edge:
+            G.add_edge(a, b, weight=w)
+    return G, len(doc_refs)
 
 
 def _slr_communities(G):
@@ -10685,6 +10770,10 @@ def render_slr_analysis_page():
         st.markdown("### 🕸️ Parameter Peta Sains")
         min_kw = st.slider("Min. kemunculan kata kunci", 2, 12, 3)
         min_au = st.slider("Min. dokumen per penulis", 1, 8, 2)
+        min_cocit = st.slider("Min. co-citation (kali referensi dikutip)", 2, 15, 3,
+                              help="Ambang minimum berapa kali sebuah referensi dikutip "
+                                   "agar tampil di jaringan co-citation. Hanya berlaku bila "
+                                   "data memuat kolom References (mis. ekspor Scopus).")
         viz_mode = st.radio(
             "Mode Visualisasi Jaringan",
             ["Network (klaster)", "Overlay (tahun)", "Density (kepadatan)", "3D (interaktif)"],
@@ -10946,7 +11035,53 @@ def render_slr_analysis_page():
                                    "peta_tematik.csv", "text/csv")
             else:
                 st.info("Belum cukup kata kunci untuk membentuk peta tematik.")
-        st.caption("Menjawab RQ2: struktur tematik, klaster topik, peta tematik, dan pergeseran fokus riset antar waktu.")
+
+        # ----- Co-citation (basis intelektual) -----
+        st.markdown("---")
+        st.markdown("#### 🔗 Analisis Co-citation (Basis Intelektual)")
+        st.caption("Analog VOSviewer *Co-citation ▸ Cited references*. Dua referensi terhubung "
+                   "bila sering **dikutip bersama** dalam daftar pustaka artikel-artikel korpus. "
+                   "Node = referensi (penulis pertama + tahun); ukuran = seberapa sering dikutip.")
+        n_with_ref = sum(1 for r in analysis if r.get("References"))
+        if n_with_ref == 0:
+            st.info(
+                "⚠️ **Data referensi belum tersedia**, sehingga co-citation belum bisa dihitung. "
+                "Analisis ini memerlukan daftar pustaka (cited references) tiap artikel, yang "
+                "tidak termuat pada ekspor saat ini.\n\n"
+                "**Cara mengaktifkan:** ekspor ulang dari **Scopus** → pada pilihan kolom CSV, "
+                "centang **_References_** (bagian *Bibliographical information / Citation information*). "
+                "Letakkan berkas hasilnya di folder `slr/` atau unggah lewat sidebar **Data Baru** — "
+                "jaringan co-citation akan muncul otomatis di sini.")
+        else:
+            Gc, n_docs_ref = _slr_build_cocitation(analysis, min_cocit, 1, max_nodes)
+            st.caption(f"{n_with_ref} dari {len(analysis)} dokumen memiliki daftar referensi terbaca "
+                       f"(mode visual mengikuti pilihan sidebar: {viz_mode}).")
+            if Gc.number_of_nodes() == 0:
+                st.info("Belum ada referensi yang memenuhi ambang. Turunkan **Min. co-citation** di sidebar.")
+            else:
+                part_c = _slr_communities(Gc)
+                fc, _ = _slr_network_figure(Gc, "Jaringan Co-citation Referensi", color_mode,
+                                            part_c, height=net_height)
+                st.plotly_chart(fc, use_container_width=True, config=SLR_PLOT_CONFIG)
+                cc1, cc2 = st.columns([3, 2])
+                with cc2:
+                    st.markdown("**Item jaringan (gaya ekspor VOSviewer)**")
+                    cc_tbl = _slr_node_table(Gc, part_c)
+                    st.dataframe(cc_tbl, use_container_width=True, hide_index=True, height=440)
+                    st.download_button("⬇️ Unduh item co-citation (CSV)",
+                                       cc_tbl.to_csv(index=False).encode("utf-8"),
+                                       "slr_cocitation_nodes.csv", "text/csv")
+                with cc1:
+                    top_ref = cc_tbl.sort_values("Kemunculan", ascending=False).head(15)
+                    fig_cc = px.bar(top_ref.sort_values("Kemunculan"), x="Kemunculan", y="Item",
+                                    orientation="h", color="Klaster",
+                                    color_continuous_scale="Viridis",
+                                    title="15 Referensi Paling Sering Dikutip")
+                    fig_cc.update_layout(height=440, margin=dict(l=8, r=8, t=52, b=8),
+                                         font=dict(size=13), title_font_size=18)
+                    st.plotly_chart(fig_cc, use_container_width=True, config=SLR_PLOT_CONFIG)
+        st.caption("Menjawab RQ2: struktur tematik, klaster topik, peta tematik, basis intelektual "
+                   "(co-citation), dan pergeseran fokus riset antar waktu.")
 
     # ---------------- SOCIAL & INTELLECTUAL ----------------
     with tab_social:
